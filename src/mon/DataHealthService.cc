@@ -11,7 +11,6 @@
  * Foundation.  See file COPYING.
  *
  */
-#include <memory>
 #include "include/memory.h"
 #include <errno.h>
 #include <map>
@@ -34,14 +33,11 @@
 #endif
 
 #include "messages/MMonHealth.h"
-#include "include/types.h"
-#include "include/Context.h"
 #include "include/assert.h"
 #include "common/Formatter.h"
 #include "common/errno.h"
 
 #include "mon/Monitor.h"
-#include "mon/QuorumService.h"
 #include "mon/DataHealthService.h"
 
 #define dout_subsys ceph_subsys_mon
@@ -143,7 +139,7 @@ int DataHealthService::update_store_stats(DataStats &ours)
   ours.store_stats.bytes_sst = extra["sst"];
   ours.store_stats.bytes_log = extra["log"];
   ours.store_stats.bytes_misc = extra["misc"];
-  ours.last_update = ceph_clock_now(g_ceph_context);
+  ours.last_update = ceph_clock_now();
 
   return 0;
 }
@@ -163,7 +159,7 @@ int DataHealthService::update_stats()
           << " total " << prettybyte_t(ours.fs_stats.byte_total)
           << ", used " << prettybyte_t(ours.fs_stats.byte_used)
           << ", avail " << prettybyte_t(ours.fs_stats.byte_avail) << dendl;
-  ours.last_update = ceph_clock_now(g_ceph_context);
+  ours.last_update = ceph_clock_now();
 
   return update_store_stats(ours);
 }

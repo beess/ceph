@@ -13,19 +13,24 @@ Linux Kernel
 
 - **Ceph Kernel Client**
 
-  We currently recommend:
+  If you are using the kernel client, the general advice is to *track* "stable"
+  or "longterm maintenance" kernel series provided by either http://kernel.org
+  or your distribution on the kernel client machines.
 
-  - 4.1.4 or later
-  - 3.16.3 or later (rbd deadlock regression in 3.16.[0-2])
-  - *NOT* 3.15.* (rbd deadlock regression)
-  - 3.14.*
+  For RBD, if you choose to *track* long-term kernels, we currently recommend
+  4.x-based "longterm maintenance" kernel series:
+
+  - 4.9.z
+  - 4.4.z
 
   These are considered pretty old, but if you must:
 
-  - 3.10.*
+  - 3.16.z
+  - 3.10.z
 
-  Firefly (CRUSH_TUNABLES3) tunables are supported starting with 3.15.
-  See `CRUSH Tunables`_ for more details.
+  For CephFS, see `CephFS best practices`_ for kernel version guidance.
+
+  Older kernel client versions may not support your `CRUSH tunables`_ profile.
 
 - **B-tree File System (Btrfs)**
 
@@ -40,8 +45,8 @@ platforms.  Generally speaking, there is very little dependence on
 specific distributions aside from the kernel and system initialization
 package (i.e., sysvinit, upstart, systemd).
 
-Infernalis (9.1.0)
-------------------
+Infernalis (9.2.z) and Jewel (10.2.z)
+-------------------------------------
 
 +----------+----------+--------------------+--------------+---------+------------+
 | Distro   | Release  | Code Name          | Kernel       | Notes   | Testing    | 
@@ -126,3 +131,5 @@ Testing
   pre-release, and released code.
 
 .. _CRUSH Tunables: ../../rados/operations/crush-map#tunables
+
+.. _CephFS best practices: ../../cephfs/best-practices

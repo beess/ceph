@@ -17,6 +17,7 @@
 # GNU Library Public License for more details.
 #
 
+source $(dirname $0)/../detect-build-env-vars.sh
 source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
 function run() {
@@ -44,7 +45,7 @@ function TEST_copy_from() {
     run_osd $dir 1 || return 1
 
     # success
-    rados -p rbd put foo rados
+    rados -p rbd put foo $(which rados)
     rados -p rbd cp foo foo2
     rados -p rbd stat foo2
 

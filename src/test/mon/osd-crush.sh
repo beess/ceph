@@ -15,6 +15,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Library Public License for more details.
 #
+source $(dirname $0)/../detect-build-env-vars.sh
 source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
 function run() {
@@ -258,11 +259,31 @@ function TEST_crush_repair_faulty_crushmap() {
 
     local crushtool_path_old=`ceph-conf --show-config-value crushtool`
     ceph tell mon.\* injectargs --crushtool "true"
+    
+    
+    #import empty crushmap should failture.because the default pool rbd use the rule
+    ceph osd setcrushmap -i $empty_map.map  2>&1|grep "Error EINVAL:  the crush rule no"|| return 1
 
+    #remove the default pool rbd
+    ceph osd pool delete rbd rbd --yes-i-really-really-mean-it || return 1
+
+    #now it can be successful to set the empty crush map
     ceph osd setcrushmap -i $empty_map.map || return 1
+
     # should be an empty crush map without any buckets
-    ! test $(ceph osd crush dump --format=xml | \
-           $XMLSTARLET sel -t -m "//buckets/bucket" -v .) || return 1
+    success=false
+    for delay in 1 2 4 8 16 32 64 128 256 ; do
+        if ! test $(ceph osd crush dump --format=xml | \
+                           $XMLSTARLET sel -t -m "//buckets/bucket" -v .) ; then
+            success=true
+            break
+        fi
+        sleep $delay
+    done
+    if ! $success ; then
+        ceph osd crush dump --format=xml
+        return 1
+    fi
     # bring them down, the "ceph" commands will try to hunt for other monitor in
     # vain, after mon.a is offline
     kill_daemons $dir || return 1

@@ -37,7 +37,7 @@ set<string> hobject_t::get_prefixes(
   else if (bits == 32)
     from.insert(mask);
   else
-    assert(0);
+    ceph_abort();
 
 
   set<uint32_t> to;
@@ -45,7 +45,7 @@ set<string> hobject_t::get_prefixes(
     for (set<uint32_t>::iterator j = from.begin();
 	 j != from.end();
 	 ++j) {
-      to.insert(*j | (1 << i));
+      to.insert(*j | (1U << i));
       to.insert(*j);
     }
     to.swap(from);
@@ -112,6 +112,7 @@ void hobject_t::encode(bufferlist& bl) const
   ::encode(max, bl);
   ::encode(nspace, bl);
   ::encode(pool, bl);
+  assert(!max || (*this == hobject_t(hobject_t::get_max())));
   ENCODE_FINISH(bl);
 }
 
@@ -141,6 +142,12 @@ void hobject_t::decode(bufferlist::iterator& bl)
 	oid.name.empty()) {
       pool = INT64_MIN;
       assert(is_min());
+    }
+
+    // for compatibility with some earlier verisons which might encoded
+    // a non-canonical max object
+    if (max) {
+      *this = hobject_t::get_max();
     }
   }
   DECODE_FINISH(bl);

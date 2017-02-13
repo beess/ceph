@@ -15,6 +15,8 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Library Public License for more details.
 #
+source $(dirname $0)/detect-build-env-vars.sh
+
 CEPH_CLI_TEST_DUP_COMMAND=1 \
 # uses CEPH_PORT going from 7202 7203 and 7204 because
 # it starts at 7202 and runs 3 mons (see vstart.sh)

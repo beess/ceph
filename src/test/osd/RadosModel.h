@@ -48,6 +48,7 @@ enum TestOpType {
   TEST_OP_READ,
   TEST_OP_WRITE,
   TEST_OP_WRITE_EXCL,
+  TEST_OP_WRITESAME,
   TEST_OP_DELETE,
   TEST_OP_SNAP_CREATE,
   TEST_OP_SNAP_REMOVE,
@@ -185,6 +186,7 @@ public:
   const uint64_t max_stride_size;
   AttrGenerator attr_gen;
   const bool no_omap;
+  const bool no_sparse;
   bool pool_snaps;
   bool write_fadvise_dontneed;
   int snapname_num;
@@ -195,6 +197,7 @@ public:
 		   uint64_t min_stride_size,
 		   uint64_t max_stride_size,
 		   bool no_omap,
+		   bool no_sparse,
 		   bool pool_snaps,
 		   bool write_fadvise_dontneed,
 		   const char *id = 0) :
@@ -211,6 +214,7 @@ public:
     min_stride_size(min_stride_size), max_stride_size(max_stride_size),
     attr_gen(2000, 20000),
     no_omap(no_omap),
+    no_sparse(no_sparse),
     pool_snaps(pool_snaps),
     write_fadvise_dontneed(write_fadvise_dontneed),
     snapname_num(0)
@@ -689,7 +693,7 @@ public:
     int r;
     if ((r = comp->get_return_value())) {
       cerr << "err " << r << std::endl;
-      assert(0);
+      ceph_abort();
     }
     done = true;
     context->update_object_version(oid, comp->get_version64());
@@ -862,7 +866,7 @@ public:
     if (tid <= last_acked_tid) {
       cerr << "Error: finished tid " << tid
 	   << " when last_acked_tid was " << last_acked_tid << std::endl;
-      assert(0);
+      ceph_abort();
     }
     last_acked_tid = tid;
 
@@ -922,6 +926,183 @@ public:
   }
 };
 
+class WriteSameOp : public TestOp {
+public:
+  string oid;
+  ContDesc cont;
+  set<librados::AioCompletion *> waiting;
+  librados::AioCompletion *rcompletion;
+  uint64_t waiting_on;
+  uint64_t last_acked_tid;
+
+  librados::ObjectReadOperation read_op;
+  librados::ObjectWriteOperation write_op;
+  bufferlist rbuffer;
+
+  WriteSameOp(int n,
+	  RadosTestContext *context,
+	  const string &oid,
+	  TestOpStat *stat = 0)
+    : TestOp(n, context, stat),
+      oid(oid), rcompletion(NULL), waiting_on(0),
+      last_acked_tid(0)
+  {}
+
+  void _begin()
+  {
+    context->state_lock.Lock();
+    done = 0;
+    stringstream acc;
+    acc << context->prefix << "OID: " << oid << " snap " << context->current_snap << std::endl;
+    string prefix = acc.str();
+
+    cont = ContDesc(context->seq_num, context->current_snap, context->seq_num, prefix);
+
+    ContentsGenerator *cont_gen;
+    cont_gen = new VarLenGenerator(
+	context->max_size, context->min_stride_size, context->max_stride_size);
+    context->update_object(cont_gen, oid, cont);
+
+    context->oid_in_use.insert(oid);
+    context->oid_not_in_use.erase(oid);
+
+    map<uint64_t, uint64_t> ranges;
+
+    cont_gen->get_ranges_map(cont, ranges);
+    std::cout << num << ":  seq_num " << context->seq_num << " ranges " << ranges << std::endl;
+    context->seq_num++;
+
+    waiting_on = ranges.size();
+    ContentsGenerator::iterator gen_pos = cont_gen->get_iterator(cont);
+    uint64_t tid = 1;
+    for (map<uint64_t, uint64_t>::iterator i = ranges.begin();
+	 i != ranges.end();
+	 ++i, ++tid) {
+      gen_pos.seek(i->first);
+      bufferlist to_write = gen_pos.gen_bl_advance(i->second);
+      assert(to_write.length() == i->second);
+      assert(to_write.length() > 0);
+      std::cout << num << ":  writing " << context->prefix+oid
+		<< " from " << i->first
+		<< " to " << i->first + i->second << " tid " << tid << std::endl;
+      pair<TestOp*, TestOp::CallbackInfo*> *cb_arg =
+	new pair<TestOp*, TestOp::CallbackInfo*>(this,
+						 new TestOp::CallbackInfo(tid));
+      librados::AioCompletion *completion =
+	context->rados.aio_create_completion((void*) cb_arg, NULL,
+					     &write_callback);
+      waiting.insert(completion);
+      librados::ObjectWriteOperation op;
+      /* no writesame multiplication factor for now */
+      op.writesame(i->first, to_write.length(), to_write);
+
+      context->io_ctx.aio_operate(
+	context->prefix+oid, completion,
+	&op);
+    }
+
+    bufferlist contbl;
+    ::encode(cont, contbl);
+    pair<TestOp*, TestOp::CallbackInfo*> *cb_arg =
+      new pair<TestOp*, TestOp::CallbackInfo*>(
+	this,
+	new TestOp::CallbackInfo(++tid));
+    librados::AioCompletion *completion = context->rados.aio_create_completion(
+      (void*) cb_arg, NULL, &write_callback);
+    waiting.insert(completion);
+    waiting_on++;
+    write_op.setxattr("_header", contbl);
+    write_op.truncate(cont_gen->get_length(cont));
+    context->io_ctx.aio_operate(
+      context->prefix+oid, completion, &write_op);
+
+    cb_arg =
+      new pair<TestOp*, TestOp::CallbackInfo*>(
+	this,
+	new TestOp::CallbackInfo(++tid));
+    rcompletion = context->rados.aio_create_completion(
+         (void*) cb_arg, NULL, &write_callback);
+    waiting_on++;
+    read_op.read(0, 1, &rbuffer, 0);
+    context->io_ctx.aio_operate(
+      context->prefix+oid, rcompletion,
+      &read_op,
+      librados::OPERATION_ORDER_READS_WRITES,  // order wrt previous write/update
+      0);
+    context->state_lock.Unlock();
+  }
+
+  void _finish(CallbackInfo *info)
+  {
+    assert(info);
+    context->state_lock.Lock();
+    uint64_t tid = info->id;
+
+    cout << num << ":  finishing writesame tid " << tid << " to " << context->prefix + oid << std::endl;
+
+    if (tid <= last_acked_tid) {
+      cerr << "Error: finished tid " << tid
+	   << " when last_acked_tid was " << last_acked_tid << std::endl;
+      ceph_abort();
+    }
+    last_acked_tid = tid;
+
+    assert(!done);
+    waiting_on--;
+    if (waiting_on == 0) {
+      uint64_t version = 0;
+      for (set<librados::AioCompletion *>::iterator i = waiting.begin();
+	   i != waiting.end();
+	   ) {
+	assert((*i)->is_complete());
+	if (int err = (*i)->get_return_value()) {
+	  cerr << "Error: oid " << oid << " writesame returned error code "
+	       << err << std::endl;
+	}
+	if ((*i)->get_version64() > version)
+	  version = (*i)->get_version64();
+	(*i)->release();
+	waiting.erase(i++);
+      }
+
+      context->update_object_version(oid, version);
+      if (rcompletion->get_version64() != version) {
+	cerr << "Error: racing read on " << oid << " returned version "
+	     << rcompletion->get_version64() << " rather than version "
+	     << version << std::endl;
+	assert(0 == "racing read got wrong version");
+      }
+
+      {
+	ObjectDesc old_value;
+	assert(context->find_object(oid, &old_value, -1));
+	if (old_value.deleted())
+	  std::cout << num << ":  left oid " << oid << " deleted" << std::endl;
+	else
+	  std::cout << num << ":  left oid " << oid << " "
+		    << old_value.most_recent() << std::endl;
+      }
+
+      rcompletion->release();
+      context->oid_in_use.erase(oid);
+      context->oid_not_in_use.insert(oid);
+      context->kick();
+      done = true;
+    }
+    context->state_lock.Unlock();
+  }
+
+  bool finished()
+  {
+    return done;
+  }
+
+  string getType()
+  {
+    return "WriteSameOp";
+  }
+};
+
 class DeleteOp : public TestOp {
 public:
   string oid;
@@ -966,7 +1147,7 @@ public:
     }
     if (r && !(r == -ENOENT && !present)) {
       cerr << "r is " << r << " while deleting " << oid << " and present is " << present << std::endl;
-      assert(0);
+      ceph_abort();
     }
 
     context->state_lock.Lock();
@@ -1031,7 +1212,7 @@ public:
     uint64_t len = 0;
     if (old_value.has_contents())
       len = old_value.most_recent_gen()->get_length(old_value.most_recent());
-    if (rand() % 2) {
+    if (context->no_sparse || rand() % 2) {
       is_sparse_read[index] = false;
       read_op.read(0,
 		   len,
@@ -1083,7 +1264,7 @@ public:
       int r = context->io_ctx.notify2(context->prefix+oid, bl, 0, NULL);
       if (r < 0) {
 	std::cerr << "r is " << r << std::endl;
-	assert(0);
+	ceph_abort();
       }
       std::cerr << num << ":  notified, waiting" << std::endl;
       ctx->wait();
@@ -1105,9 +1286,10 @@ public:
     }
     if (!context->no_omap) {
       op.omap_get_vals_by_keys(omap_requested_keys, &omap_returned_values, 0);
-
-      op.omap_get_keys("", -1, &omap_keys, 0);
-      op.omap_get_vals("", -1, &omap, 0);
+      // NOTE: we're ignore pmore here, which assumes the OSD limit is high
+      // enough for us.
+      op.omap_get_keys2("", -1, &omap_keys, nullptr, nullptr);
+      op.omap_get_vals2("", -1, &omap, nullptr, nullptr);
       op.omap_get_header(&header, 0);
     }
     op.getxattrs(&xattrs, 0);
@@ -1155,13 +1337,13 @@ public:
       if (err != retval) {
         cerr << num << ": Error: oid " << oid << " read returned different error codes: "
              << retval << " and " << err << std::endl;
-	assert(0);
+	ceph_abort();
       }
       if (err) {
         if (!(err == -ENOENT && old_value.deleted())) {
           cerr << num << ": Error: oid " << oid << " read returned error code "
                << err << std::endl;
-          assert(0);
+          ceph_abort();
         }
       } else if (version != old_value.version) {
 	cerr << num << ": oid " << oid << " version is " << version
@@ -1211,7 +1393,7 @@ public:
 	    }
 	  }
 	}
-	if (context->errors) assert(0);
+	if (context->errors) ceph_abort();
       }
 
       // Attributes
@@ -1324,7 +1506,7 @@ public:
       int ret = context->io_ctx.snap_create(snapname.c_str());
       if (ret) {
 	cerr << "snap_create returned " << ret << std::endl;
-	assert(0);
+	ceph_abort();
       }
       assert(!context->io_ctx.snap_lookup(snapname.c_str(), &snap));
 
@@ -1352,7 +1534,7 @@ public:
       int r = context->io_ctx.selfmanaged_snap_set_write_ctx(context->seq, snapset);
       if (r) {
 	cerr << "r is " << r << " snapset is " << snapset << " seq is " << context->seq << std::endl;
-	assert(0);
+	ceph_abort();
       }
     }
   }
@@ -1399,7 +1581,7 @@ public:
       int r = context->io_ctx.selfmanaged_snap_set_write_ctx(context->seq, snapset);
       if (r) {
 	cerr << "r is " << r << " snapset is " << snapset << " seq is " << context->seq << std::endl;
-	assert(0);
+	ceph_abort();
       }
     }
     context->state_lock.Unlock();
@@ -1457,7 +1639,7 @@ public:
 
     if (r) {
       cerr << "r is " << r << std::endl;
-      assert(0);
+      ceph_abort();
     }
 
     {
@@ -1586,7 +1768,7 @@ public:
     int r;
     if ((r = comps[last_finished]->get_return_value()) != 0) {
       cerr << "err " << r << std::endl;
-      assert(0);
+      ceph_abort();
     }
     if (--outstanding == 0) {
       done = true;
@@ -1697,7 +1879,7 @@ public:
 	} else {
 	  cerr << "Error: oid " << oid << " copy_from " << oid_src << " returned error code "
 	       << r << std::endl;
-	  assert(0);
+	  ceph_abort();
 	}
       } else {
 	assert(!version || comp->get_version64() == version);

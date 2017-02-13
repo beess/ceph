@@ -31,7 +31,7 @@
 
 /**
  * LFNIndex also encapsulates logic for manipulating
- * subdirectories of of a collection as well as the long filename
+ * subdirectories of a collection as well as the long filename
  * logic.
  *
  * The protected methods provide machinery for derived classes to
@@ -66,7 +66,7 @@
     } catch (RetryException) {			\
       failed = true;				\
     } catch (...) {				\
-      assert(0);				\
+      ceph_abort();				\
     }						\
   }						\
   return -1;					\
@@ -127,11 +127,12 @@ private:
 public:
   /// Constructor
   LFNIndex(
+    CephContext* cct,
     coll_t collection,
     const char *base_path, ///< [in] path to Index root
     uint32_t index_version,
     double _error_injection_probability=0)
-    : CollectionIndex(collection),
+    : CollectionIndex(cct, collection),
       base_path(base_path),
       index_version(index_version),
       error_injection_enabled(false),

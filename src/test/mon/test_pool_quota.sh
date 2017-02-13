@@ -5,13 +5,16 @@
 #
 
 # Includes
-source ../qa/workunits/ceph-helpers.sh
+
+source $(dirname $0)/../detect-build-env-vars.sh 
+
+source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
 function run() {
     local dir=$1
     shift
 
-    export CEPH_MON="127.0.0.1:17108"
+    export CEPH_MON="127.0.0.1:17108" # git grep '\<17108\>' : there must be only one
     export CEPH_ARGS
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
@@ -33,8 +36,8 @@ function TEST_pool_quota() {
    
     local poolname=testquoa
     ceph osd  pool create $poolname 20
-    local objects=`ceph df detail | grep -w $poolname|awk '{print $4}'`
-    local bytes=`ceph df detail | grep -w $poolname|awk '{print $5}'`
+    local objects=`ceph df detail | grep -w $poolname|awk '{print $3}'`
+    local bytes=`ceph df detail | grep -w $poolname|awk '{print $4}'`
 
     echo $objects
     echo $bytes
@@ -46,8 +49,8 @@ function TEST_pool_quota() {
     ceph osd pool set-quota  $poolname   max_objects 1000
     ceph osd pool set-quota  $poolname  max_bytes 1024
 
-    objects=`ceph df detail | grep -w $poolname|awk '{print $4}'`
-    bytes=`ceph df detail | grep -w $poolname|awk '{print $5}'`
+    objects=`ceph df detail | grep -w $poolname|awk '{print $3}'`
+    bytes=`ceph df detail | grep -w $poolname|awk '{print $4}'`
    
      if [ $objects != '1000' ] || [ $bytes != '1024' ] ;
        then

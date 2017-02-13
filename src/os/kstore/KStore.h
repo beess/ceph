@@ -57,6 +57,7 @@ public:
 
   /// an in-memory object
   struct Onode {
+    CephContext* cct;
     std::atomic_int nref;  ///< reference count
 
     ghobject_t oid;
@@ -76,12 +77,14 @@ public:
 
     map<uint64_t,bufferlist> pending_stripes;  ///< unwritten stripes
 
-    Onode(const ghobject_t& o, const string& k)
-      : nref(0),
+    Onode(CephContext* cct, const ghobject_t& o, const string& k)
+      : cct(cct),
+	nref(0),
 	oid(o),
 	key(k),
 	dirty(false),
-	exists(false) {
+	exists(false),
+        tail_offset(0) {
     }
 
     void flush();
@@ -104,6 +107,7 @@ public:
   typedef boost::intrusive_ptr<Onode> OnodeRef;
 
   struct OnodeHashLRU {
+    CephContext* cct;
     typedef boost::intrusive::list<
       Onode,
       boost::intrusive::member_hook<
@@ -115,7 +119,7 @@ public:
     ceph::unordered_map<ghobject_t,OnodeRef> onode_map;  ///< forward lookups
     lru_list_t lru;                                      ///< lru
 
-    OnodeHashLRU() {}
+    OnodeHashLRU(CephContext* cct) : cct(cct) {}
 
     void add(const ghobject_t& oid, OnodeRef o);
     void _touch(OnodeRef o);
@@ -126,7 +130,7 @@ public:
     int trim(int max=-1);
   };
 
-  struct Collection {
+  struct Collection : public CollectionImpl {
     KStore *store;
     coll_t cid;
     kstore_cnode_t cnode;
@@ -137,6 +141,10 @@ public:
     OnodeHashLRU onode_map;
 
     OnodeRef get_onode(const ghobject_t& oid, bool create);
+
+    const coll_t &get_cid() override {
+      return cid;
+    }
 
     bool contains(const ghobject_t& oid) {
       if (cid.is_meta())
@@ -151,7 +159,7 @@ public:
 
     Collection(KStore *ns, coll_t c);
   };
-  typedef ceph::shared_ptr<Collection> CollectionRef;
+  typedef boost::intrusive_ptr<Collection> CollectionRef;
 
   class OmapIteratorImpl : public ObjectMap::ObjectMapIteratorImpl {
     CollectionRef c;
@@ -203,8 +211,8 @@ public:
       return "???";
     }
 
-    void log_state_latency(PerfCounters *logger, int state) {      
-        utime_t lat, now = ceph_clock_now(g_ceph_context);
+    void log_state_latency(PerfCounters *logger, int state) {
+        utime_t lat, now = ceph_clock_now();
         lat = now - start;
         logger->tinc(state, lat);
         start = now;
@@ -233,7 +241,7 @@ public:
 	oncommit(NULL),
 	onreadable(NULL),
 	onreadable_sync(NULL),
-        start(ceph_clock_now(g_ceph_context)){
+        start(ceph_clock_now()){
       //cout << "txc new " << this << std::endl;
     }
     ~TransContext() {
@@ -259,9 +267,10 @@ public:
 
     Sequencer *parent;
 
-    OpSequencer()
-	//set the qlock to to PTHREAD_MUTEX_RECURSIVE mode
-      : parent(NULL) {
+    OpSequencer(CephContext* cct)
+	//set the qlock to PTHREAD_MUTEX_RECURSIVE mode
+      : Sequencer_impl(cct),
+	parent(NULL) {
     }
     ~OpSequencer() {
       assert(q.empty());
@@ -305,7 +314,6 @@ public:
   // --------------------------------------------------------
   // members
 private:
-  CephContext *cct;
   KeyValueDB *db;
   uuid_d fsid;
   int path_fd;  ///< open handle to $path
@@ -366,7 +374,7 @@ private:
   TransContext *_txc_create(OpSequencer *osr);
   void _txc_release(TransContext *txc, uint64_t offset, uint64_t length);
   void _txc_add_transaction(TransContext *txc, Transaction *t);
-  int _txc_finalize(OpSequencer *osr, TransContext *txc);
+  void _txc_finalize(OpSequencer *osr, TransContext *txc);
   void _txc_state_proc(TransContext *txc);
   void _txc_finish_kv(TransContext *txc);
   void _txc_finish(TransContext *txc);
@@ -389,6 +397,10 @@ private:
 			uint64_t offset, bufferlist& bl);
   void _do_remove_stripe(TransContext *txc, OnodeRef o, uint64_t offset);
 
+  int _collection_list(
+    Collection *c, const ghobject_t& start, const ghobject_t& end,
+    bool sort_bitwise, int max, vector<ghobject_t> *ls, ghobject_t *next);
+
 public:
   KStore(CephContext *cct, const string& path);
   ~KStore();
@@ -409,7 +421,7 @@ public:
   int umount();
   void _sync();
 
-  int fsck();
+  int fsck(bool deep) override;
 
 
   int validate_hobject_key(const hobject_t &obj) const override {
@@ -423,8 +435,13 @@ public:
   int mkjournal() {
     return 0;
   }
+  void dump_perf_counters(Formatter *f) override {
+    f->open_object_section("perf_counters");
+    logger->dump_formatted(f, false);
+    f->close_section();
+  }
 
-  int statfs(struct statfs *buf);
+  int statfs(struct store_statfs_t *buf) override;
 
   using ObjectStore::exists;
   bool exists(const coll_t& cid, const ghobject_t& oid);
@@ -434,6 +451,9 @@ public:
     const ghobject_t& oid,
     struct stat *st,
     bool allow_eio = false); // struct stat?
+  int set_collection_opts(
+    const coll_t& cid,
+    const pool_opts_t& opts);
   using ObjectStore::read;
   int read(
     const coll_t& cid,
@@ -459,12 +479,16 @@ public:
 
   int list_collections(vector<coll_t>& ls);
   bool collection_exists(const coll_t& c);
-  bool collection_empty(const coll_t& c);
+  int collection_empty(const coll_t& c, bool *empty);
 
-  using ObjectStore::collection_list;
-  int collection_list(const coll_t& cid, ghobject_t start, ghobject_t end,
-		      bool sort_bitwise, int max,
-		      vector<ghobject_t> *ls, ghobject_t *next);
+  int collection_list(
+    const coll_t& cid, const ghobject_t& start, const ghobject_t& end,
+    bool sort_bitwise, int max,
+    vector<ghobject_t> *ls, ghobject_t *next) override;
+  int collection_list(
+    CollectionHandle &c, const ghobject_t& start, const ghobject_t& end,
+    bool sort_bitwise, int max,
+    vector<ghobject_t> *ls, ghobject_t *next) override;
 
   using ObjectStore::omap_get;
   int omap_get(
@@ -520,6 +544,10 @@ public:
   }
   uuid_d get_fsid() {
     return fsid;
+  }
+
+  uint64_t estimate_objects_overhead(uint64_t num_objects) override {
+    return num_objects * 300; //assuming per-object overhead is 300 bytes
   }
 
   objectstore_perf_stat_t get_cur_stats() {
@@ -610,7 +638,8 @@ private:
 		    CollectionRef& c,
 		    OnodeRef& o,
 		    uint64_t expected_object_size,
-		    uint64_t expected_write_size);
+		    uint64_t expected_write_size,
+		    uint32_t flags);
   int _clone(TransContext *txc,
 	     CollectionRef& c,
 	     OnodeRef& oldo,

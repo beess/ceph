@@ -53,6 +53,14 @@ protected:
 
 public:
   /**
+   * Various Messenger conditional config/type flags to allow
+   * different "transport" Messengers to tune themselves
+   */
+  static const int HAS_HEAVY_TRAFFIC    = 0x0001;
+  static const int HAS_MANY_CONNECTIONS = 0x0002;
+  static const int HEARTBEAT            = 0x0004;
+
+  /**
    *  The CephContext this Messenger uses. Many other components initialize themselves
    *  from this value.
    */
@@ -151,13 +159,14 @@ public:
    * @param lname logical name of the messenger in this process (e.g., "client")
    * @param nonce nonce value to uniquely identify this instance on the current host
    * @param features bits for the local connection
+   * @param cflags general set of flags to configure transport resources
    */
   static Messenger *create(CephContext *cct,
                            const string &type,
                            entity_name_t name,
 			   string lname,
                            uint64_t nonce,
-			   uint64_t features = 0);
+			   uint64_t cflags);
 
   /**
    * create a new messenger
@@ -230,7 +239,7 @@ public:
    *
    * @param addr The address to use as a template.
    */
-  virtual void set_addr_unknowns(entity_addr_t &addr) = 0;
+  virtual void set_addr_unknowns(const entity_addr_t &addr) = 0;
   /// Get the default send priority.
   int get_default_send_priority() { return default_send_priority; }
   /**
@@ -400,6 +409,14 @@ public:
    */
   virtual int rebind(const set<int>& avoid_ports) { return -EOPNOTSUPP; }
   /**
+   * Bind the 'client' Messenger to a specific address.Messenger will bind
+   * the address before connect to others when option ms_bind_before_connect
+   * is true.
+   * @param bind_addr The address to bind to.
+   * @return 0 on success, or -1 on error, or -errno if
+   */
+  virtual int client_bind(const entity_addr_t& bind_addr) = 0;
+  /**
    * @} // Configuration
    */
 
@@ -545,9 +562,10 @@ public:
    *
    * @param m The Message we are fast dispatching. We take ownership
    * of one reference to it.
+   * If none of our Dispatchers can handle it, ceph_abort().
    */
   void ms_fast_dispatch(Message *m) {
-    m->set_dispatch_stamp(ceph_clock_now(cct));
+    m->set_dispatch_stamp(ceph_clock_now());
     for (list<Dispatcher*>::iterator p = fast_dispatchers.begin();
 	 p != fast_dispatchers.end();
 	 ++p) {
@@ -556,7 +574,7 @@ public:
 	return;
       }
     }
-    assert(0);
+    ceph_abort();
   }
   /**
    *
@@ -577,7 +595,7 @@ public:
    *  one reference to it.
    */
   void ms_deliver_dispatch(Message *m) {
-    m->set_dispatch_stamp(ceph_clock_now(cct));
+    m->set_dispatch_stamp(ceph_clock_now());
     for (list<Dispatcher*>::iterator p = dispatchers.begin();
 	 p != dispatchers.end();
 	 ++p) {
@@ -671,6 +689,24 @@ public:
 	 ++p)
       (*p)->ms_handle_remote_reset(con);
   }
+
+  /**
+   * Notify each Dispatcher of a Connection for which reconnection
+   * attempts are being refused. Call this function whenever you
+   * detect that a lossy Connection has been disconnected and it's
+   * impossible to reconnect.
+   *
+   * @param con Pointer to the broken Connection.
+   */
+  void ms_deliver_handle_refused(Connection *con) {
+    for (list<Dispatcher*>::iterator p = dispatchers.begin();
+         p != dispatchers.end();
+         ++p) {
+      if ((*p)->ms_handle_refused(con))
+        return;
+    }
+  }
+
   /**
    * Get the AuthAuthorizer for a new outgoing Connection.
    *

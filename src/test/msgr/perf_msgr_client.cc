@@ -54,6 +54,7 @@ class MessengerClient {
     void ms_fast_dispatch(Message *m);
     bool ms_handle_reset(Connection *con) { return true; }
     void ms_handle_remote_reset(Connection *con) {}
+    bool ms_handle_refused(Connection *con) { return false; }
     bool ms_verify_authorizer(Connection *con, int peer_type, int protocol,
                               bufferlist& authorizer, bufferlist& authorizer_reply,
                               bool& isvalid, CryptoKey& session_key) {
@@ -129,7 +130,7 @@ class MessengerClient {
     addr.parse(serveraddr.c_str());
     addr.set_nonce(0);
     for (int i = 0; i < jobs; ++i) {
-      Messenger *msgr = Messenger::create(g_ceph_context, type, entity_name_t::CLIENT(0), "client", getpid()+i);
+      Messenger *msgr = Messenger::create(g_ceph_context, type, entity_name_t::CLIENT(0), "client", getpid()+i, 0);
       msgr->set_default_policy(Messenger::Policy::lossless_client(0, 0));
       entity_inst_t inst(entity_name_t::OSD(0), addr);
       ConnectionRef conn = msgr->get_connection(inst);
@@ -172,7 +173,8 @@ int main(int argc, char **argv)
   vector<const char*> args;
   argv_to_vec(argc, (const char **)argv, args);
 
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
   g_ceph_context->_conf->apply_changes(NULL);
 
@@ -187,14 +189,18 @@ int main(int argc, char **argv)
   int think_time = atoi(args[4]);
   int len = atoi(args[5]);
 
-  cerr << " using ms-type " << g_ceph_context->_conf->ms_type << std::endl;
+  std::string public_msgr_type = g_ceph_context->_conf->ms_public_type.empty() ? g_ceph_context->_conf->ms_type : g_ceph_context->_conf->ms_public_type;
+
+  cerr << " using ms-public-type " << public_msgr_type << std::endl;
   cerr << "       server ip:port " << args[0] << std::endl;
   cerr << "       numjobs " << numjobs << std::endl;
   cerr << "       concurrency " << concurrent << std::endl;
   cerr << "       ios " << ios << std::endl;
   cerr << "       thinktime(us) " << think_time << std::endl;
   cerr << "       message data bytes " << len << std::endl;
-  MessengerClient client(g_ceph_context->_conf->ms_type, args[0], think_time);
+
+  MessengerClient client(public_msgr_type, args[0], think_time);
+
   client.ready(concurrent, numjobs, ios, len);
   Cycles::init();
   uint64_t start = Cycles::rdtsc();

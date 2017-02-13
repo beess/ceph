@@ -19,6 +19,8 @@
 #include "common/LogClient.h"
 #include "common/Timer.h"
 
+#include "messages/MCommand.h"
+
 #include "Beacon.h"
 #include "DamageTable.h"
 #include "MDSMap.h"
@@ -41,6 +43,7 @@ enum {
   l_mds_dir_fetch,
   l_mds_dir_commit,
   l_mds_dir_split,
+  l_mds_dir_merge,
   l_mds_inode_max,
   l_mds_inodes,
   l_mds_inodes_top,
@@ -125,7 +128,7 @@ class MDSRank {
 
   public:
     mds_rank_t get_nodeid() const { return whoami; }
-    uint64_t get_metadata_pool();
+    int64_t get_metadata_pool();
 
     // Reference to global MDS::mds_lock, so that users of MDSRank don't
     // carry around references to the outer MDS, and we can substitute
@@ -191,9 +194,7 @@ class MDSRank {
     bool is_clientreplay() const { return state == MDSMap::STATE_CLIENTREPLAY; }
     bool is_active() const { return state == MDSMap::STATE_ACTIVE; }
     bool is_stopping() const { return state == MDSMap::STATE_STOPPING; }
-    bool is_oneshot_replay() const { return state == MDSMap::STATE_ONESHOT_REPLAY; }
-    bool is_any_replay() const { return (is_replay() || is_standby_replay() ||
-        is_oneshot_replay()); }
+    bool is_any_replay() const { return (is_replay() || is_standby_replay()); }
     bool is_stopped() const { return mdsmap->is_stopped(whoami); }
 
     void handle_write_error(int err);
@@ -208,7 +209,7 @@ class MDSRank {
       Cond cond;
       public:
       explicit ProgressThread(MDSRank *mds_) : mds(mds_) {}
-      void * entry(); 
+      void * entry() override;
       void shutdown();
       void signal() {cond.Signal();}
     } progress_thread;
@@ -227,7 +228,7 @@ class MDSRank {
     ceph::heartbeat_handle_d *hb;  // Heartbeat for threads using mds_lock
     void heartbeat_reset();
 
-    bool is_stale_message(Message *m);
+    bool is_stale_message(Message *m) const;
 
     map<mds_rank_t, version_t> peer_mdsmap_epoch;
 
@@ -248,6 +249,8 @@ class MDSRank {
      * Emit clog warnings for any ops reported as warnings by optracker
      */
     void check_ops_in_flight();
+  
+    int mds_slow_req_count;
 
     /**
      * Share MDSMap with clients
@@ -276,10 +279,13 @@ class MDSRank {
         MDSMap *& mdsmap_,
         Messenger *msgr,
         MonClient *monc_,
-        Objecter *objecter_,
         Context *respawn_hook_,
         Context *suicide_hook_);
+
+  protected:
     ~MDSRank();
+
+  public:
 
     // Daemon lifetime functions: these guys break the abstraction
     // and call up into the parent MDSDaemon instance.  It's kind
@@ -353,6 +359,7 @@ class MDSRank {
 
     void set_osd_epoch_barrier(epoch_t e);
     epoch_t get_osd_epoch_barrier() const {return osd_epoch_barrier;}
+    epoch_t get_osd_epoch() const;
 
     ceph_tid_t issue_tid() { return ++last_tid; }
 
@@ -360,7 +367,9 @@ class MDSRank {
 
     MDSMap *get_mds_map() { return mdsmap; }
 
-    int get_req_rate() { return logger->get(l_mds_request); }
+    int get_req_rate() const { return logger->get(l_mds_request); }
+  
+    int get_mds_slow_req_count() const { return mds_slow_req_count; }
 
     void dump_status(Formatter *f) const;
 
@@ -488,21 +497,20 @@ public:
                            Formatter *f, std::ostream& ss);
   void handle_mds_map(MMDSMap *m, MDSMap *oldmap);
   void handle_osd_map();
-  bool kill_session(int64_t session_id);
+  bool kill_session(int64_t session_id, bool wait, std::stringstream& ss);
   void update_log_config();
   bool handle_command_legacy(std::vector<std::string> args);
 
   bool handle_command(
     const cmdmap_t &cmdmap,
-    bufferlist const &inbl,
+    MCommand *m,
     int *r,
     std::stringstream *ds,
-    std::stringstream *ss);
+    std::stringstream *ss,
+    bool *need_reply);
 
-  void dump_sessions(
-      const SessionFilter &filter, Formatter *f) const;
-  std::vector<entity_name_t> evict_sessions(
-      const SessionFilter &filter);
+  void dump_sessions(const SessionFilter &filter, Formatter *f) const;
+  void evict_sessions(const SessionFilter &filter, MCommand *m);
 
   // Call into me from MDS::ms_dispatch
   bool ms_dispatch(Message *m);
@@ -516,7 +524,6 @@ public:
       MDSMap *& mdsmap_,
       Messenger *msgr,
       MonClient *monc_,
-      Objecter *objecter_,
       Context *respawn_hook_,
       Context *suicide_hook_);
 };

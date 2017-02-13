@@ -278,6 +278,24 @@ namespace librados
     // marked full; ops will either succeed (e.g., delete) or return
     // EDQUOT or ENOSPC
     OPERATION_FULL_TRY           = LIBRADOS_OPERATION_FULL_TRY,
+    //mainly for delete
+    OPERATION_FULL_FORCE	 = LIBRADOS_OPERATION_FULL_FORCE,
+  };
+
+  /*
+   * Alloc hint flags for the alloc_hint operation.
+   */
+  enum AllocHintFlags {
+    ALLOC_HINT_FLAG_SEQUENTIAL_WRITE = 1,
+    ALLOC_HINT_FLAG_RANDOM_WRITE = 2,
+    ALLOC_HINT_FLAG_SEQUENTIAL_READ = 4,
+    ALLOC_HINT_FLAG_RANDOM_READ = 8,
+    ALLOC_HINT_FLAG_APPEND_ONLY = 16,
+    ALLOC_HINT_FLAG_IMMUTABLE = 32,
+    ALLOC_HINT_FLAG_SHORTLIVED = 64,
+    ALLOC_HINT_FLAG_LONGLIVED = 128,
+    ALLOC_HINT_FLAG_COMPRESSIBLE = 256,
+    ALLOC_HINT_FLAG_INCOMPRESSIBLE = 512,
   };
 
   /*
@@ -298,10 +316,6 @@ namespace librados
 
     void cmpxattr(const char *name, uint8_t op, const bufferlist& val);
     void cmpxattr(const char *name, uint8_t op, uint64_t v);
-    void src_cmpxattr(const std::string& src_oid,
-		      const char *name, int op, const bufferlist& val);
-    void src_cmpxattr(const std::string& src_oid,
-		      const char *name, int op, uint64_t v);
     void exec(const char *cls, const char *method, bufferlist& inbl);
     void exec(const char *cls, const char *method, bufferlist& inbl, bufferlist *obl, int *prval);
     void exec(const char *cls, const char *method, bufferlist& inbl, ObjectOperationCompletion *completion);
@@ -369,6 +383,8 @@ namespace librados
 
     void write(uint64_t off, const bufferlist& bl);
     void write_full(const bufferlist& bl);
+    void writesame(uint64_t off, uint64_t write_len,
+		   const bufferlist& bl);
     void append(const bufferlist& bl);
     void remove();
     void truncate(uint64_t off);
@@ -377,9 +393,6 @@ namespace librados
     void setxattr(const char *name, const bufferlist& bl);
     void tmap_update(const bufferlist& cmdbl);
     void tmap_put(const bufferlist& bl);
-    void clone_range(uint64_t dst_off,
-                     const std::string& src_oid, uint64_t src_off,
-                     size_t len);
     void selfmanaged_snap_rollback(uint64_t snapid);
 
     /**
@@ -446,9 +459,13 @@ namespace librados
      *
      * @param expected_object_size expected size of the object, in bytes
      * @param expected_write_size expected size of writes to the object, in bytes
+     * @param flags flags ()
      */
     void set_alloc_hint(uint64_t expected_object_size,
                         uint64_t expected_write_size);
+    void set_alloc_hint2(uint64_t expected_object_size,
+			 uint64_t expected_write_size,
+			 uint32_t flags);
 
     /**
      * Pin/unpin an object in cache tier
@@ -498,6 +515,23 @@ namespace librados
       const std::string &start_after,
       uint64_t max_return,
       std::map<std::string, bufferlist> *out_vals,
+      int *prval) __attribute__ ((deprecated));  // use v2
+
+    /**
+     * omap_get_vals: keys and values from the object omap
+     *
+     * Get up to max_return keys and values beginning after start_after
+     *
+     * @param start_after [in] list no keys smaller than start_after
+     * @param max_return [in] list no more than max_return key/value pairs
+     * @param out_vals [out] place returned values in out_vals on completion
+     * @param prval [out] place error code in prval upon completion
+     */
+    void omap_get_vals2(
+      const std::string &start_after,
+      uint64_t max_return,
+      std::map<std::string, bufferlist> *out_vals,
+      bool *pmore,
       int *prval);
 
     /**
@@ -516,6 +550,26 @@ namespace librados
       const std::string &filter_prefix,
       uint64_t max_return,
       std::map<std::string, bufferlist> *out_vals,
+      int *prval) __attribute__ ((deprecated));  // use v2
+
+    /**
+     * omap_get_vals2: keys and values from the object omap
+     *
+     * Get up to max_return keys and values beginning after start_after
+     *
+     * @param start_after [in] list keys starting after start_after
+     * @param filter_prefix [in] list only keys beginning with filter_prefix
+     * @param max_return [in] list no more than max_return key/value pairs
+     * @param out_vals [out] place returned values in out_vals on completion
+     * @param pmore [out] pointer to bool indicating whether there are more keys
+     * @param prval [out] place error code in prval upon completion
+     */
+    void omap_get_vals2(
+      const std::string &start_after,
+      const std::string &filter_prefix,
+      uint64_t max_return,
+      std::map<std::string, bufferlist> *out_vals,
+      bool *pmore,
       int *prval);
 
 
@@ -532,7 +586,24 @@ namespace librados
     void omap_get_keys(const std::string &start_after,
                        uint64_t max_return,
                        std::set<std::string> *out_keys,
-                       int *prval);
+                       int *prval) __attribute__ ((deprecated)); // use v2
+
+    /**
+     * omap_get_keys2: keys from the object omap
+     *
+     * Get up to max_return keys beginning after start_after
+     *
+     * @param start_after [in] list keys starting after start_after
+     * @param max_return [in] list no more than max_return keys
+     * @param out_keys [out] place returned values in out_keys on completion
+     * @param pmore [out] pointer to bool indicating whether there are more keys
+     * @param prval [out] place error code in prval upon completion
+     */
+    void omap_get_keys2(const std::string &start_after,
+			uint64_t max_return,
+			std::set<std::string> *out_keys,
+			bool *pmore,
+			int *prval);
 
     /**
      * omap_get_header: get header from object omap
@@ -683,9 +754,8 @@ namespace librados
      * NOTE: this call steals the contents of @param bl.
      */
     int write_full(const std::string& oid, bufferlist& bl);
-    int clone_range(const std::string& dst_oid, uint64_t dst_off,
-                   const std::string& src_oid, uint64_t src_off,
-                   size_t len);
+    int writesame(const std::string& oid, bufferlist& bl,
+		  size_t write_len, uint64_t off);
     int read(const std::string& oid, bufferlist& bl, size_t len, uint64_t off);
     int remove(const std::string& oid);
     int remove(const std::string& oid, int flags);
@@ -719,15 +789,31 @@ namespace librados
                       const std::string& start_after,
                       uint64_t max_return,
                       std::map<std::string, bufferlist> *out_vals);
+    int omap_get_vals2(const std::string& oid,
+		       const std::string& start_after,
+		       uint64_t max_return,
+		       std::map<std::string, bufferlist> *out_vals,
+		       bool *pmore);
     int omap_get_vals(const std::string& oid,
                       const std::string& start_after,
                       const std::string& filter_prefix,
                       uint64_t max_return,
                       std::map<std::string, bufferlist> *out_vals);
+    int omap_get_vals2(const std::string& oid,
+		       const std::string& start_after,
+		       const std::string& filter_prefix,
+		       uint64_t max_return,
+		       std::map<std::string, bufferlist> *out_vals,
+		       bool *pmore);
     int omap_get_keys(const std::string& oid,
                       const std::string& start_after,
                       uint64_t max_return,
                       std::set<std::string> *out_keys);
+    int omap_get_keys2(const std::string& oid,
+		       const std::string& start_after,
+		       uint64_t max_return,
+		       std::set<std::string> *out_keys,
+		       bool *pmore);
     int omap_get_header(const std::string& oid,
                         bufferlist *bl);
     int omap_get_vals_by_keys(const std::string& oid,
@@ -769,8 +855,10 @@ namespace librados
       __attribute__ ((deprecated));
 
     int selfmanaged_snap_create(uint64_t *snapid);
+    void aio_selfmanaged_snap_create(uint64_t *snapid, AioCompletion *c);
 
     int selfmanaged_snap_remove(uint64_t snapid);
+    void aio_selfmanaged_snap_remove(uint64_t snapid, AioCompletion *c);
 
     int selfmanaged_snap_rollback(const std::string& oid, uint64_t snapid);
 
@@ -908,6 +996,8 @@ namespace librados
     int aio_append(const std::string& oid, AioCompletion *c, const bufferlist& bl,
 		  size_t len);
     int aio_write_full(const std::string& oid, AioCompletion *c, const bufferlist& bl);
+    int aio_writesame(const std::string& oid, AioCompletion *c, const bufferlist& bl,
+		      size_t write_len, uint64_t off);
 
     /**
      * Asychronously remove an object
@@ -923,6 +1013,7 @@ namespace librados
      * other than SNAP_HEAD
      */
     int aio_remove(const std::string& oid, AioCompletion *c);
+    int aio_remove(const std::string& oid, AioCompletion *c, int flags);
 
     /**
      * Wait for all currently pending aio writes to be safe.
@@ -940,7 +1031,10 @@ namespace librados
      * @returns 0 on success, negative error code on failure
      */
     int aio_flush_async(AioCompletion *c);
-
+    int aio_getxattr(const std::string& oid, AioCompletion *c, const char *name, bufferlist& bl);
+    int aio_getxattrs(const std::string& oid, AioCompletion *c, std::map<std::string, bufferlist>& attrset);
+    int aio_setxattr(const std::string& oid, AioCompletion *c, const char *name, bufferlist& bl);
+    int aio_rmxattr(const std::string& oid, AioCompletion *c, const char *name);
     int aio_stat(const std::string& oid, AioCompletion *c, uint64_t *psize, time_t *pmtime);
     int aio_stat2(const std::string& oid, AioCompletion *c, uint64_t *psize, struct timespec *pts);
 
@@ -954,6 +1048,12 @@ namespace librados
 
     int aio_exec(const std::string& oid, AioCompletion *c, const char *cls, const char *method,
 	         bufferlist& inbl, bufferlist *outbl);
+
+    /*
+     * asynchronous version of unlock
+     */
+    int aio_unlock(const std::string &oid, const std::string &name,
+	           const std::string &cookie, AioCompletion *c);
 
     // compound object operations
     int operate(const std::string& oid, ObjectWriteOperation *op);
@@ -992,8 +1092,12 @@ namespace librados
     // watch/notify
     int watch2(const std::string& o, uint64_t *handle,
 	       librados::WatchCtx2 *ctx);
+    int watch3(const std::string& o, uint64_t *handle,
+	       librados::WatchCtx2 *ctx, uint32_t timeout);
     int aio_watch(const std::string& o, AioCompletion *c, uint64_t *handle,
 	       librados::WatchCtx2 *ctx);
+    int aio_watch2(const std::string& o, AioCompletion *c, uint64_t *handle,
+	       librados::WatchCtx2 *ctx, uint32_t timeout);
     int unwatch2(uint64_t handle);
     int aio_unwatch(uint64_t handle, AioCompletion *c);
     /**
@@ -1076,10 +1180,13 @@ namespace librados
     int set_alloc_hint(const std::string& o,
                        uint64_t expected_object_size,
                        uint64_t expected_write_size);
+    int set_alloc_hint2(const std::string& o,
+			uint64_t expected_object_size,
+			uint64_t expected_write_size,
+			uint32_t flags);
 
     // assert version for next sync operations
     void set_assert_version(uint64_t ver);
-    void set_assert_src_version(const std::string& o, uint64_t ver);
 
     /**
      * Pin/unpin an object in cache tier
@@ -1090,7 +1197,7 @@ namespace librados
     int cache_pin(const std::string& o);
     int cache_unpin(const std::string& o);
 
-    const std::string& get_pool_name() const;
+    std::string get_pool_name() const;
 
     void locator_set_key(const std::string& key);
     void set_namespace(const std::string& nspace);
@@ -1172,6 +1279,8 @@ namespace librados
 
     int mon_command(std::string cmd, const bufferlist& inbl,
 		    bufferlist *outbl, std::string *outs);
+    int mgr_command(std::string cmd, const bufferlist& inbl,
+		    bufferlist *outbl, std::string *outs);
     int osd_command(int osdid, std::string cmd, const bufferlist& inbl,
                     bufferlist *outbl, std::string *outs);
     int pg_command(const char *pgstr, std::string cmd, const bufferlist& inbl,
@@ -1183,7 +1292,7 @@ namespace librados
     // Features useful for test cases
     void test_blacklist_self(bool set);
 
-    /* listing objects */
+    /* pool info */
     int pool_list(std::list<std::string>& v);
     int pool_list2(std::list<std::pair<int64_t, std::string> >& v);
     int get_pool_stats(std::list<std::string>& v,
@@ -1195,6 +1304,9 @@ namespace librados
     int get_pool_stats(std::list<std::string>& v,
                        std::string& category,
 		       std::map<std::string, stats_map>& stats);
+    /// check if pool has selfmanaged snaps
+    bool get_pool_is_selfmanaged_snaps_mode(const std::string& poolname);
+
     int cluster_stat(cluster_stat_t& result);
     int cluster_fsid(std::string *fsid);
 

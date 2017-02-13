@@ -33,6 +33,7 @@ using namespace std;
 
 #include "common/Timer.h"
 #include "common/WorkQueue.h"
+#include "common/perf_counters.h"
 
 #include "common/Mutex.h"
 #include "HashIndex.h"
@@ -52,13 +53,13 @@ using namespace std;
 
 #if defined(__linux__)
 # ifndef BTRFS_SUPER_MAGIC
-#define BTRFS_SUPER_MAGIC 0x9123683E
+#define BTRFS_SUPER_MAGIC 0x9123683EL
 # endif
 # ifndef XFS_SUPER_MAGIC
-#define XFS_SUPER_MAGIC 0x58465342
+#define XFS_SUPER_MAGIC 0x58465342L
 # endif
 # ifndef ZFS_SUPER_MAGIC
-#define ZFS_SUPER_MAGIC 0x2fc12fc1
+#define ZFS_SUPER_MAGIC 0x2fc12fc1L
 # endif
 #endif
 
@@ -66,6 +67,31 @@ using namespace std;
 class FileStoreBackend;
 
 #define CEPH_FS_FEATURE_INCOMPAT_SHARDS CompatSet::Feature(1, "sharded objects")
+
+enum {
+  l_filestore_first = 84000,
+  l_filestore_journal_queue_ops,
+  l_filestore_journal_queue_bytes,
+  l_filestore_journal_ops,
+  l_filestore_journal_bytes,
+  l_filestore_journal_latency,
+  l_filestore_journal_wr,
+  l_filestore_journal_wr_bytes,
+  l_filestore_journal_full,
+  l_filestore_committing,
+  l_filestore_commitcycle,
+  l_filestore_commitcycle_interval,
+  l_filestore_commitcycle_latency,
+  l_filestore_op_queue_max_ops,
+  l_filestore_op_queue_ops,
+  l_filestore_ops,
+  l_filestore_op_queue_max_bytes,
+  l_filestore_op_queue_bytes,
+  l_filestore_bytes,
+  l_filestore_apply_latency,
+  l_filestore_queue_transaction_latency_avg,
+  l_filestore_last,
+};
 
 class FSSuperblock {
 public:
@@ -96,16 +122,16 @@ public:
     return target_version;
   }
 
-  static int get_block_device_fsid(const string& path, uuid_d *fsid);
-
+  static int get_block_device_fsid(CephContext* cct, const string& path,
+				   uuid_d *fsid);
   struct FSPerfTracker {
     PerfCounters::avg_tracker<uint64_t> os_commit_latency;
     PerfCounters::avg_tracker<uint64_t> os_apply_latency;
 
     objectstore_perf_stat_t get_cur_stats() const {
       objectstore_perf_stat_t ret;
-      ret.filestore_commit_latency = os_commit_latency.avg();
-      ret.filestore_apply_latency = os_apply_latency.avg();
+      ret.os_commit_latency = os_commit_latency.avg();
+      ret.os_apply_latency = os_apply_latency.avg();
       return ret;
     }
 
@@ -143,14 +169,12 @@ private:
   bool _need_temp_object_collection(const coll_t& cid, const ghobject_t& oid) {
     // - normal temp case: cid is pg, object is temp (pool < -1)
     // - hammer temp case: cid is pg (or already temp), object pool is -1
-    return (cid.is_pg() && (oid.hobj.pool < -1 ||
-			oid.hobj.pool == -1));
+    return cid.is_pg() && oid.hobj.pool <= -1;
   }
   void _kludge_temp_object_collection(coll_t& cid, const ghobject_t& oid) {
     // - normal temp case: cid is pg, object is temp (pool < -1)
     // - hammer temp case: cid is pg (or already temp), object pool is -1
-    if (cid.is_pg() && (oid.hobj.pool < -1 ||
-			oid.hobj.pool == -1))
+    if (cid.is_pg() && oid.hobj.pool <= -1)
       cid = cid.get_temp();
   }
   void init_temp_collections();
@@ -291,7 +315,7 @@ private:
     void flush() {
       Mutex::Locker l(qlock);
 
-      while (g_conf->filestore_blackhole)
+      while (cct->_conf->filestore_blackhole)
 	cond.Wait(qlock);  // wait forever
 
 
@@ -320,8 +344,9 @@ private:
       }
     }
 
-    explicit OpSequencer(int i)
-      : qlock("FileStore::OpSequencer::qlock", false, false),
+    OpSequencer(CephContext* cct, int i)
+      : Sequencer_impl(cct),
+	qlock("FileStore::OpSequencer::qlock", false, false),
 	parent(0),
 	apply_lock("FileStore::OpSequencer::apply_lock", false, false),
         id(i) {}
@@ -359,7 +384,7 @@ private:
       return true;
     }
     void _dequeue(OpSequencer *o) {
-      assert(0);
+      ceph_abort();
     }
     bool _empty() {
       return store->op_queue.empty();
@@ -415,8 +440,8 @@ public:
 		 bool force_clear_omap=false);
 
 public:
-  FileStore(const std::string &base, const std::string &jdev,
-    osflagbits_t flags = 0,
+  FileStore(CephContext* cct, const std::string &base, const std::string &jdev,
+	    osflagbits_t flags = 0,
     const char *internal_name = "filestore", bool update_to=false);
   ~FileStore();
 
@@ -451,6 +476,11 @@ public:
   bool needs_journal() {
     return false;
   }
+  void dump_perf_counters(Formatter *f) override {
+    f->open_object_section("perf_counters");
+    logger->dump_formatted(f, false);
+    f->close_section();
+  }
 
   int write_version_stamp();
   int version_stamp_is_valid(uint32_t *version);
@@ -463,7 +493,7 @@ public:
 
   void collect_metadata(map<string,string> *pm);
 
-  int statfs(struct statfs *buf);
+  int statfs(struct store_statfs_t *buf) override;
 
   int _do_transactions(
     vector<Transaction> &tls, uint64_t op_seq,
@@ -499,7 +529,8 @@ public:
 				const SequencerPosition &spos);
 
   /// close a replay guard opened with in_progress=true
-  void _close_replay_guard(int fd, const SequencerPosition& spos);
+  void _close_replay_guard(int fd, const SequencerPosition& spos,
+			   const ghobject_t *oid=0);
   void _close_replay_guard(const coll_t& cid, const SequencerPosition& spos);
 
   /**
@@ -536,6 +567,10 @@ public:
     const ghobject_t& oid,
     struct stat *st,
     bool allow_eio = false);
+  using ObjectStore::set_collection_opts;
+  int set_collection_opts(
+    const coll_t& cid,
+    const pool_opts_t& opts);
   using ObjectStore::read;
   int read(
     const coll_t& cid,
@@ -559,7 +594,7 @@ public:
   int _truncate(const coll_t& cid, const ghobject_t& oid, uint64_t size);
   int _clone(const coll_t& cid, const ghobject_t& oldoid, const ghobject_t& newoid,
 	     const SequencerPosition& spos);
-  int _clone_range(const coll_t& cid, const ghobject_t& oldoid, const ghobject_t& newoid,
+  int _clone_range(const coll_t& oldcid, const ghobject_t& oldoid, const coll_t& newcid, const ghobject_t& newoid,
 		   uint64_t srcoff, uint64_t len, uint64_t dstoff,
 		   const SequencerPosition& spos);
   int _do_clone_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff);
@@ -587,6 +622,8 @@ public:
     fsid = u;
   }
   uuid_d get_fsid() { return fsid; }
+  
+  uint64_t estimate_objects_overhead(uint64_t num_objects);
 
   // DEBUG read error injection, an object is removed from both on delete()
   Mutex read_error_lock;
@@ -613,27 +650,20 @@ public:
   int _rmattrs(const coll_t& cid, const ghobject_t& oid,
 	       const SequencerPosition &spos);
 
-  int collection_getattr(const coll_t& c, const char *name, void *value, size_t size);
-  int collection_getattr(const coll_t& c, const char *name, bufferlist& bl);
-  int collection_getattrs(const coll_t& cid, map<string,bufferptr> &aset);
-
-  int _collection_setattr(const coll_t& c, const char *name, const void *value, size_t size);
-  int _collection_rmattr(const coll_t& c, const char *name);
-  int _collection_setattrs(const coll_t& cid, map<string,bufferptr> &aset);
   int _collection_remove_recursive(const coll_t &cid,
 				   const SequencerPosition &spos);
 
   // collections
   using ObjectStore::collection_list;
-  int collection_list(const coll_t& c, ghobject_t start, ghobject_t end,
+  int collection_list(const coll_t& c,
+		      const ghobject_t& start, const ghobject_t& end,
 		      bool sort_bitwise, int max,
 		      vector<ghobject_t> *ls, ghobject_t *next);
   int list_collections(vector<coll_t>& ls);
   int list_collections(vector<coll_t>& ls, bool include_temp);
-  int collection_version_current(const coll_t& c, uint32_t *version);
   int collection_stat(const coll_t& c, struct stat *st);
   bool collection_exists(const coll_t& c);
-  bool collection_empty(const coll_t& c);
+  int collection_empty(const coll_t& c, bool *empty);
 
   // omap (see ObjectStore.h for documentation)
   using ObjectStore::omap_get;
@@ -685,6 +715,8 @@ public:
   void dump_start(const std::string& file);
   void dump_stop();
   void dump_transactions(vector<Transaction>& ls, uint64_t seq, OpSequencer *osr);
+
+  virtual int apply_layout_settings(const coll_t &cid);
 
 private:
   void _inject_failure();
@@ -804,6 +836,10 @@ protected:
 public:
   explicit FileStoreBackend(FileStore *fs) : filestore(fs) {}
   virtual ~FileStoreBackend() {}
+
+  CephContext* cct() const {
+    return filestore->cct;
+  }
 
   static FileStoreBackend *create(long f_type, FileStore *fs);
 

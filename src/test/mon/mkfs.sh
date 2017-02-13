@@ -18,6 +18,8 @@
 set -xe
 PS4='${BASH_SOURCE[0]}:$LINENO: ${FUNCNAME[0]}:  '
 
+source $(dirname $0)/../detect-build-env-vars.sh
+
 DIR=mkfs
 export CEPH_CONF=/dev/null
 unset CEPH_ARGS
@@ -43,7 +45,6 @@ function mon_mkfs() {
         --id $MON_ID \
         --fsid $fsid \
         --erasure-code-dir=$CEPH_LIB \
-        --compression-dir=$CEPH_LIB \
         --mkfs \
         --mon-data=$MON_DIR \
         --mon-initial-members=$MON_ID \
@@ -58,7 +59,6 @@ function mon_run() {
         --mon-osd-full-ratio=.99 \
         --mon-data-avail-crit=1 \
         --erasure-code-dir=$CEPH_LIB \
-        --compression-dir=$CEPH_LIB \
         --mon-data=$MON_DIR \
         --log-file=$MON_DIR/log \
         --mon-cluster-log-file=$MON_DIR/log \
@@ -86,7 +86,6 @@ function auth_none() {
         --mon-osd-full-ratio=.99 \
         --mon-data-avail-crit=1 \
         --erasure-code-dir=$CEPH_LIB \
-        --compression-dir=$CEPH_LIB \
         --mon-data=$MON_DIR \
         --extract-monmap $MON_DIR/monmap
 
@@ -130,6 +129,7 @@ function auth_cephx_key() {
         return 1
     else
         rm -fr $MON_DIR/store.db
+        rm -fr $MON_DIR/kv_backend
     fi
 
     mon_mkfs --key=$key
@@ -153,7 +153,6 @@ function makedir() {
         --id $MON_ID \
         --mon-osd-full-ratio=.99 \
         --mon-data-avail-crit=1 \
-        --compression-dir=$CEPH_LIB \
         --erasure-code-dir=$CEPH_LIB \
         --mkfs \
         --mon-data=$toodeep 2>&1 | tee $DIR/makedir.log

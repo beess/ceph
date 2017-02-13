@@ -15,6 +15,7 @@
 #include "test/librados_test_stub/TestRadosClient.h"
 #include "test/librados_test_stub/TestMemRadosClient.h"
 #include "objclass/objclass.h"
+#include "osd/osd_types.h"
 #include <boost/bind.hpp>
 #include <boost/shared_ptr.hpp>
 #include <deque>
@@ -23,6 +24,7 @@
 #include "include/assert.h"
 #include "include/compat.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rados
 
 namespace {
@@ -556,9 +558,19 @@ int IoCtx::selfmanaged_snap_create(uint64_t *snapid) {
   return ctx->selfmanaged_snap_create(snapid);
 }
 
+void IoCtx::aio_selfmanaged_snap_create(uint64_t *snapid, AioCompletion* c) {
+  TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
+  return ctx->aio_selfmanaged_snap_create(snapid, c->pc);
+}
+
 int IoCtx::selfmanaged_snap_remove(uint64_t snapid) {
   TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
   return ctx->selfmanaged_snap_remove(snapid);
+}
+
+void IoCtx::aio_selfmanaged_snap_remove(uint64_t snapid, AioCompletion* c) {
+  TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
+  ctx->aio_selfmanaged_snap_remove(snapid, c->pc);
 }
 
 int IoCtx::selfmanaged_snap_rollback(const std::string& oid,
@@ -905,6 +917,8 @@ int Rados::ioctx_create(const char *name, IoCtx &io) {
   if (ret) {
     return ret;
   }
+
+  io.close();
   io.io_ctx_impl = reinterpret_cast<IoCtxImpl*>(p);
   return 0;
 }
@@ -916,6 +930,8 @@ int Rados::ioctx_create2(int64_t pool_id, IoCtx &io)
   if (ret) {
     return ret;
   }
+
+  io.close();
   io.io_ctx_impl = reinterpret_cast<IoCtxImpl*>(p);
   return 0;
 }
@@ -1159,6 +1175,37 @@ int cls_cxx_write_full(cls_method_context_t hctx, bufferlist *inbl) {
   return ctx->io_ctx_impl->write_full(ctx->oid, *inbl, ctx->snapc);
 }
 
+int cls_cxx_list_watchers(cls_method_context_t hctx,
+			  obj_list_watch_response_t *watchers) {
+  librados::TestClassHandler::MethodContext *ctx =
+    reinterpret_cast<librados::TestClassHandler::MethodContext*>(hctx);
+
+  std::list<obj_watch_t> obj_watchers;
+  int r = ctx->io_ctx_impl->list_watchers(ctx->oid, &obj_watchers);
+  if (r < 0) {
+    return r;
+  }
+
+  for (auto &w : obj_watchers) {
+    watch_item_t watcher;
+    watcher.name = entity_name_t::CLIENT(w.watcher_id);
+    watcher.cookie = w.cookie;
+    watcher.timeout_seconds = w.timeout_seconds;
+    watcher.addr.parse(w.addr, 0);
+    watchers->entries.push_back(watcher);
+  }
+
+  return 0;
+}
+
+uint64_t cls_get_features(cls_method_context_t hctx) {
+  return CEPH_FEATURES_SUPPORTED_DEFAULT;
+}
+
+uint64_t cls_get_client_features(cls_method_context_t hctx) {
+  return CEPH_FEATURES_SUPPORTED_DEFAULT;
+}
+
 int cls_log(int level, const char *format, ...) {
   int size = 256;
   va_list ap;
@@ -1187,4 +1234,13 @@ int cls_register_cxx_method(cls_handle_t hclass, const char *method,
     cls_method_handle_t *handle) {
   librados::TestClassHandler *cls = get_class_handler();
   return cls->create_method(hclass, method, class_call, handle);
+}
+
+int cls_register_cxx_filter(cls_handle_t hclass,
+                            const std::string &filter_name,
+                            cls_cxx_filter_factory_t fn,
+                            cls_filter_handle_t *)
+{
+  librados::TestClassHandler *cls = get_class_handler();
+  return cls->create_filter(hclass, filter_name, fn);
 }

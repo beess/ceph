@@ -14,6 +14,7 @@
 #include "MDSUtility.h"
 #include "mon/MonClient.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 
 
@@ -138,6 +139,7 @@ bool MDSUtility::ms_dispatch(Message *m)
    default:
      return false;
    }
+   m->put();
    return true;
 }
 

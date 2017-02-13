@@ -22,6 +22,7 @@
 #include "TableTool.h"
 
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << __func__ << ": "
@@ -310,9 +311,11 @@ int TableTool::main(std::vector<const char*> &argv)
   }
 
   dout(4) << "connecting to RADOS..." << dendl;
-  rados.connect();
- 
-
+  r = rados.connect();
+  if (r < 0) {
+    derr << "couldn't connect to cluster: " << cpp_strerror(r) << dendl;
+    return r;
+  }
 
   // Require at least 3 args <rank> <mode> <arg> [args...]
   if (argv.size() < 3) {
@@ -332,7 +335,7 @@ int TableTool::main(std::vector<const char*> &argv)
 
   auto fs =  fsmap->get_filesystem(role_selector.get_ns());
   assert(fs != nullptr);
-  int const pool_id = fs->mds_map.get_metadata_pool();
+  int64_t const pool_id = fs->mds_map.get_metadata_pool();
   dout(4) << "resolving pool " << pool_id << dendl;
   std::string pool_name;
   r = rados.pool_reverse_lookup(pool_id, &pool_name);
@@ -364,7 +367,6 @@ int TableTool::main(std::vector<const char*> &argv)
       jf.open_object_section("reset_snap_status");
       jf.dump_int("result", r);
       jf.close_section();
-      return r;
     } else {
       derr << "Invalid table '" << table << "'" << dendl;
       usage();

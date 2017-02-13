@@ -1,4 +1,8 @@
-#!/bin/sh -e
+#!/bin/bash -e
+
+source $(dirname $0)/../detect-build-env-vars.sh
+
+[ -z "$CEPH_ROOT" ] && CEPH_ROOT=..
 
 dir=$CEPH_ROOT/ceph-object-corpus
 
@@ -8,7 +12,13 @@ failed=0
 numtests=0
 pids=""
 
-myversion=`ceph-dencoder version`
+if [ -x ./ceph-dencoder ]; then
+  CEPH_DENCODER=./ceph-dencoder
+else
+  CEPH_DENCODER=ceph-dencoder
+fi
+
+myversion=`$CEPH_DENCODER version`
 DEBUG=0
 WAITALL_DELAY=.1
 debug() { if [ "$DEBUG" -gt 0 ]; then echo "DEBUG: $*" >&2; fi }
@@ -23,7 +33,7 @@ test_object() {
     tmp2=`mktemp /tmp/typ-XXXXXXXXX`
 
     rm -f $output_file
-    if ceph-dencoder type $type 2>/dev/null; then
+    if $CEPH_DENCODER type $type 2>/dev/null; then
       #echo "type $type";
       echo "        $vdir/objects/$type"
 
@@ -31,7 +41,7 @@ test_object() {
       incompat=""
       incompat_paths=""
       sawarversion=0
-      for iv in `ls -v $dir/archive`; do
+      for iv in `ls $dir/archive | sort -n`; do
         if [ "$iv" = "$arversion" ]; then
           sawarversion=1
         fi
@@ -43,7 +53,7 @@ test_object() {
           # all paths for this type into variable. Assuming that this path won't contain any
           # whitechars (implication of above for loop).
           if [ -d "$dir/archive/$iv/forward_incompat/$type" ]; then
-            if [ -n "`ls -v $dir/archive/$iv/forward_incompat/$type/`" ]; then
+            if [ -n "`ls $dir/archive/$iv/forward_incompat/$type/ | sort -n`" ]; then
               incompat_paths="$incompat_paths $dir/archive/$iv/forward_incompat/$type"
             else
               echo "type $type directory empty, ignoring whole type instead of single objects"
@@ -59,7 +69,7 @@ test_object() {
       if [ -n "$incompat" ]; then
         if [ -z "$incompat_paths" ]; then
           echo "skipping incompat $type version $arversion, changed at $incompat < code $myversion"
-          continue
+	  return
         else
           # If we are ignoring not whole type, but objects that are in $incompat_path,
           # we don't skip here, just give info.
@@ -86,9 +96,9 @@ test_object() {
           continue
         fi;
 
-        ./ceph-dencoder type $type import $vdir/objects/$type/$f decode dump_json > $tmp1 &
+        $CEPH_DENCODER type $type import $vdir/objects/$type/$f decode dump_json > $tmp1 &
         pid1="$!"
-        ./ceph-dencoder type $type import $vdir/objects/$type/$f decode encode decode dump_json > $tmp2 &
+        $CEPH_DENCODER type $type import $vdir/objects/$type/$f decode encode decode dump_json > $tmp2 &
         pid2="$!"
         #echo "\t$vdir/$type/$f"
         if ! wait $pid1; then
@@ -108,7 +118,7 @@ test_object() {
         # nondeterministically.  compare the sorted json
         # output.  this is a weaker test, but is better than
         # nothing.
-        if ! ceph-dencoder type $type is_deterministic; then
+        if ! $CEPH_DENCODER type $type is_deterministic; then
           echo "  sorting json output for nondeterministic object"
           for f in $tmp1 $tmp2; do
             sort $f | sed 's/,$//' > $f.new
@@ -161,9 +171,14 @@ waitall() { # PID...
 
 # Using $MAX_PARALLEL_JOBS jobs if defined, unless the number of logical
 # processors
-max_parallel_jobs=${MAX_PARALLEL_JOBS:-$(nproc)}
+if [ `uname` == FreeBSD ]; then
+  NPROC=`sysctl -n hw.ncpu`
+  max_parallel_jobs=${MAX_PARALLEL_JOBS:-${NPROC}}
+else
+  max_parallel_jobs=${MAX_PARALLEL_JOBS:-$(nproc)}
+fi
 
-for arversion in `ls -v $dir/archive`; do
+for arversion in `ls $dir/archive | sort -n`; do
   vdir="$dir/archive/$arversion"
   #echo $vdir
 

@@ -3,9 +3,11 @@ import functools
 import socket
 import os
 import time
+import sys
 
+from datetime import datetime
 from nose import with_setup, SkipTest
-from nose.tools import eq_ as eq, assert_raises
+from nose.tools import eq_ as eq, assert_raises, assert_not_equal
 from rados import (Rados,
                    LIBRADOS_OP_FLAG_FADVISE_DONTNEED,
                    LIBRADOS_OP_FLAG_FADVISE_NOCACHE,
@@ -13,8 +15,13 @@ from rados import (Rados,
 from rbd import (RBD, Image, ImageNotFound, InvalidArgument, ImageExists,
                  ImageBusy, ImageHasSnapshots, ReadOnlyImage,
                  FunctionNotSupported, ArgumentOutOfRange,
+                 DiskQuotaExceeded, ConnectionShutdown,
                  RBD_FEATURE_LAYERING, RBD_FEATURE_STRIPINGV2,
-                 RBD_FEATURE_EXCLUSIVE_LOCK)
+                 RBD_FEATURE_EXCLUSIVE_LOCK, RBD_FEATURE_JOURNALING,
+                 RBD_MIRROR_MODE_DISABLED, RBD_MIRROR_MODE_IMAGE,
+                 RBD_MIRROR_MODE_POOL, RBD_MIRROR_IMAGE_ENABLED,
+                 RBD_MIRROR_IMAGE_DISABLED, MIRROR_IMAGE_STATUS_STATE_UNKNOWN,
+                 RBD_LOCK_MODE_EXCLUSIVE)
 
 rados = None
 ioctx = None
@@ -41,7 +48,7 @@ def setup_module():
 
 def teardown_module():
     global ioctx
-    ioctx.__del__()
+    ioctx.close()
     global rados
     rados.delete_pool(pool_name)
     rados.shutdown()
@@ -129,6 +136,10 @@ def check_default_params(format, order=None, features=None, stripe_count=None,
             rados.conf_set('rbd_default_stripe_count', str(stripe_count or 0))
         if stripe_unit is not None:
             rados.conf_set('rbd_default_stripe_unit', str(stripe_unit or 0))
+        feature_data_pool = 0
+        datapool = rados.conf_get('rbd_default_data_pool')
+        if not len(datapool) == 0:
+            feature_data_pool = 128
         image_name = get_temp_image_name()
         if exception is None:
             RBD().create(ioctx, image_name, IMG_SIZE)
@@ -141,8 +152,12 @@ def check_default_params(format, order=None, features=None, stripe_count=None,
                     eq(expected_order, actual_order)
 
                     expected_features = features
-                    if expected_features is None or format == 1:
-                        expected_features = 0 if format == 1 else 61
+                    if format == 1:
+                        expected_features = 0
+                    elif expected_features is None:
+                        expected_features = 61 | feature_data_pool
+                    else:
+                        expected_features |= feature_data_pool
                     eq(expected_features, image.features())
 
                     expected_stripe_count = stripe_count
@@ -187,14 +202,14 @@ def test_create_defaults():
     check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 1, 1 << 16)
     check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 10, 1 << 20)
     check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 10, 1 << 16)
-    check_default_params(2, 20, RBD_FEATURE_STRIPINGV2, 0, 0)
+    check_default_params(2, 20, 0, 0, 0)
     # make sure invalid combinations of stripe unit and order are still invalid
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 10, 1 << 50, exception=InvalidArgument)
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 10, 100, exception=InvalidArgument)
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 0, 1, exception=InvalidArgument)
     check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 1, 0, exception=InvalidArgument)
     # 0 stripe unit and count are still ignored
-    check_default_params(2, 22, RBD_FEATURE_STRIPINGV2, 0, 0)
+    check_default_params(2, 22, 0, 0, 0)
 
 def test_context_manager():
     with Rados(conffile='') as cluster:
@@ -286,6 +301,7 @@ class TestImage(object):
     def tearDown(self):
         self.image.close()
         remove_image()
+        self.image = None
 
     @require_new_format()
     @blacklist_features([RBD_FEATURE_EXCLUSIVE_LOCK])
@@ -311,6 +327,13 @@ class TestImage(object):
         eq(image.stripe_count(), stripe_count)
         image.close()
         RBD().remove(ioctx, image_name)
+
+    @require_new_format()
+    def test_id(self):
+        assert_not_equal(b'', self.image.id())
+
+    def test_block_name_prefix(self):
+        assert_not_equal(b'', self.image.block_name_prefix())
 
     def test_invalidate_cache(self):
         self.image.write(b'abc', 0)
@@ -501,6 +524,30 @@ class TestImage(object):
         self.image.remove_snap('snap1')
         assert_raises(ImageNotFound, self.image.unprotect_snap, 'snap1')
         assert_raises(ImageNotFound, self.image.is_protected_snap, 'snap1')
+
+    def test_snap_timestamp(self):
+        self.image.create_snap('snap1')
+        eq(['snap1'], [snap['name'] for snap in self.image.list_snaps()])
+        for snap in self.image.list_snaps():
+            snap_id = snap["id"]
+        time = self.image.get_snap_timestamp(snap_id)
+        assert_not_equal(b'', time.year)
+        assert_not_equal(0, time.year)
+        assert_not_equal(time.year, '1970')
+        self.image.remove_snap('snap1')
+
+    def test_limit_snaps(self):
+        self.image.set_snap_limit(2)
+        eq(2, self.image.get_snap_limit())
+        self.image.create_snap('snap1')
+        self.image.create_snap('snap2')
+        assert_raises(DiskQuotaExceeded, self.image.create_snap, 'snap3')
+        self.image.remove_snap_limit()
+        self.image.create_snap('snap3')
+
+        self.image.remove_snap('snap1')
+        self.image.remove_snap('snap2')
+        self.image.remove_snap('snap3')
 
     @require_features([RBD_FEATURE_EXCLUSIVE_LOCK])
     def test_remove_with_exclusive_lock(self):
@@ -714,6 +761,65 @@ class TestImage(object):
         self.image.remove_snap('snap1')
         self.image.remove_snap('snap2')
 
+    def test_aio_read(self):
+        # this is a list so that the local cb() can modify it
+        retval = [None]
+        def cb(_, buf):
+            retval[0] = buf
+
+        # test1: success case
+        comp = self.image.aio_read(0, 20, cb)
+        comp.wait_for_complete_and_cb()
+        eq(retval[0], b'\0' * 20)
+        eq(comp.get_return_value(), 20)
+        eq(sys.getrefcount(comp), 2)
+
+        # test2: error case
+        retval[0] = 1
+        comp = self.image.aio_read(IMG_SIZE, 20, cb)
+        comp.wait_for_complete_and_cb()
+        eq(None, retval[0])
+        assert(comp.get_return_value() < 0)
+        eq(sys.getrefcount(comp), 2)
+
+    def test_aio_write(self):
+        retval = [None]
+        def cb(comp):
+            retval[0] = comp.get_return_value()
+
+        data = rand_data(256)
+        comp = self.image.aio_write(data, 256, cb)
+        comp.wait_for_complete_and_cb()
+        eq(retval[0], 0)
+        eq(comp.get_return_value(), 0)
+        eq(sys.getrefcount(comp), 2)
+        eq(self.image.read(256, 256), data)
+
+    def test_aio_discard(self):
+        retval = [None]
+        def cb(comp):
+            retval[0] = comp.get_return_value()
+
+        data = rand_data(256)
+        self.image.write(data, 0)
+        comp = self.image.aio_discard(0, 256, cb)
+        comp.wait_for_complete_and_cb()
+        eq(retval[0], 0)
+        eq(comp.get_return_value(), 0)
+        eq(sys.getrefcount(comp), 2)
+        eq(self.image.read(256, 256), b'\0' * 256)
+
+    def test_aio_flush(self):
+        retval = [None]
+        def cb(comp):
+            retval[0] = comp.get_return_value()
+
+        comp = self.image.aio_flush(cb)
+        comp.wait_for_complete_and_cb()
+        eq(retval[0], 0)
+        eq(sys.getrefcount(comp), 2)
+
+
 
 def check_diff(image, offset, length, from_snapshot, expected):
     extents = []
@@ -750,18 +856,42 @@ class TestClone(object):
         self.image.close()
         remove_image()
 
-    @require_features([RBD_FEATURE_STRIPINGV2])
-    def test_with_params(self):
-        global features
+    def _test_with_params(self, features=None, order=None, stripe_unit=None,
+                          stripe_count=None):
         self.image.create_snap('snap2')
         self.image.protect_snap('snap2')
         clone_name2 = get_temp_image_name()
-        self.rbd.clone(ioctx, image_name, 'snap2', ioctx, clone_name2,
-                       features, self.image.stat()['order'],
-                       self.image.stripe_unit(), self.image.stripe_count())
+        if features is None:
+            self.rbd.clone(ioctx, image_name, 'snap2', ioctx, clone_name2)
+        elif order is None:
+            self.rbd.clone(ioctx, image_name, 'snap2', ioctx, clone_name2,
+                           features)
+        elif stripe_unit is None:
+            self.rbd.clone(ioctx, image_name, 'snap2', ioctx, clone_name2,
+                           features, order)
+        elif stripe_count is None:
+            self.rbd.clone(ioctx, image_name, 'snap2', ioctx, clone_name2,
+                           features, order, stripe_unit)
+        else:
+            self.rbd.clone(ioctx, image_name, 'snap2', ioctx, clone_name2,
+                           features, order, stripe_unit, stripe_count)
         self.rbd.remove(ioctx, clone_name2)
         self.image.unprotect_snap('snap2')
         self.image.remove_snap('snap2')
+
+    def test_with_params(self):
+        self._test_with_params()
+
+    def test_with_params2(self):
+        global features
+        self._test_with_params(features, self.image.stat()['order'])
+
+    @require_features([RBD_FEATURE_STRIPINGV2])
+    def test_with_params3(self):
+        global features
+        self._test_with_params(features, self.image.stat()['order'],
+                               self.image.stripe_unit(),
+                               self.image.stripe_count())
 
     def test_unprotected(self):
         self.image.create_snap('snap2')
@@ -1022,7 +1152,7 @@ class TestExclusiveLock(object):
     def tearDown(self):
         remove_image()
         global ioctx2
-        ioctx2.__del__()
+        ioctx2.close()
         global rados2
         rados2.shutdown()
 
@@ -1104,6 +1234,7 @@ class TestExclusiveLock(object):
                 image1.remove_snap('snap')
 
     def test_follower_discard(self):
+        global rados
         with Image(ioctx, image_name) as image1, Image(ioctx2, image_name) as image2:
             data = rand_data(256)
             image1.write(data, 0)
@@ -1111,7 +1242,10 @@ class TestExclusiveLock(object):
             eq(image1.is_exclusive_lock_owner(), False)
             eq(image2.is_exclusive_lock_owner(), True)
             read = image2.read(0, 256)
-            eq(256 * b'\0', read)
+            if rados.conf_get('rbd_skip_partial_discard') == 'false':
+                eq(256 * b'\0', read)
+            else:
+                eq(data, read)
 
     def test_follower_write(self):
         with Image(ioctx, image_name) as image1, Image(ioctx2, image_name) as image2:
@@ -1123,3 +1257,171 @@ class TestExclusiveLock(object):
             for offset in [0, IMG_SIZE // 2]:
                 read = image2.read(offset, 256)
                 eq(data, read)
+    def test_acquire_release_lock(self):
+        with Image(ioctx, image_name) as image:
+            image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+            image.lock_release()
+
+    def test_break_lock(self):
+        blacklist_rados = Rados(conffile='')
+        blacklist_rados.connect()
+        try:
+            blacklist_ioctx = blacklist_rados.open_ioctx(pool_name)
+            try:
+                rados2.conf_set('rbd_blacklist_on_break_lock', 'true')
+                with Image(ioctx2, image_name) as image, \
+                     Image(blacklist_ioctx, image_name) as blacklist_image:
+                    blacklist_image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+                    assert_raises(ReadOnlyImage, image.lock_acquire,
+                                  RBD_LOCK_MODE_EXCLUSIVE)
+
+                    lock_owners = list(image.lock_get_owners())
+                    eq(1, len(lock_owners))
+                    eq(RBD_LOCK_MODE_EXCLUSIVE, lock_owners[0]['mode'])
+                    image.lock_break(RBD_LOCK_MODE_EXCLUSIVE,
+                                     lock_owners[0]['owner'])
+
+                    blacklist_rados.wait_for_latest_osdmap()
+                    data = rand_data(256)
+                    assert_raises(ConnectionShutdown,
+                                  blacklist_image.write, data, 0)
+
+                    image.lock_acquire(RBD_LOCK_MODE_EXCLUSIVE)
+
+                    try:
+                        blacklist_image.close()
+                    except ConnectionShutdown:
+                        pass
+            finally:
+                blacklist_ioctx.close()
+        finally:
+            blacklist_rados.shutdown()
+
+class TestMirroring(object):
+
+    @staticmethod
+    def check_info(info, global_id, state, primary=None):
+        eq(global_id, info['global_id'])
+        eq(state, info['state'])
+        if primary is not None:
+            eq(primary, info['primary'])
+
+    def setUp(self):
+        self.rbd = RBD()
+        self.initial_mirror_mode = self.rbd.mirror_mode_get(ioctx)
+        self.rbd.mirror_mode_set(ioctx, RBD_MIRROR_MODE_POOL)
+        create_image()
+        self.image = Image(ioctx, image_name)
+
+    def tearDown(self):
+        self.image.close()
+        remove_image()
+        self.rbd.mirror_mode_set(ioctx, self.initial_mirror_mode)
+
+
+    def test_mirror_peer(self):
+        eq([], list(self.rbd.mirror_peer_list(ioctx)))
+        cluster_name = "test_cluster"
+        client_name = "test_client"
+        uuid = self.rbd.mirror_peer_add(ioctx, cluster_name, client_name)
+        assert(uuid)
+        peer = {
+            'uuid' : uuid,
+            'cluster_name' : cluster_name,
+            'client_name' : client_name,
+            }
+        eq([peer], list(self.rbd.mirror_peer_list(ioctx)))
+        cluster_name = "test_cluster1"
+        self.rbd.mirror_peer_set_cluster(ioctx, uuid, cluster_name)
+        client_name = "test_client1"
+        self.rbd.mirror_peer_set_client(ioctx, uuid, client_name)
+        peer = {
+            'uuid' : uuid,
+            'cluster_name' : cluster_name,
+            'client_name' : client_name,
+            }
+        eq([peer], list(self.rbd.mirror_peer_list(ioctx)))
+        self.rbd.mirror_peer_remove(ioctx, uuid)
+        eq([], list(self.rbd.mirror_peer_list(ioctx)))
+
+    @require_features([RBD_FEATURE_EXCLUSIVE_LOCK,
+                       RBD_FEATURE_JOURNALING])
+    def test_mirror_image(self):
+
+        self.rbd.mirror_mode_set(ioctx, RBD_MIRROR_MODE_IMAGE)
+        self.image.mirror_image_disable(True)
+        info = self.image.mirror_image_get_info()
+        self.check_info(info, '', RBD_MIRROR_IMAGE_DISABLED, False)
+
+        self.image.mirror_image_enable()
+        info = self.image.mirror_image_get_info()
+        global_id = info['global_id']
+        self.check_info(info, global_id, RBD_MIRROR_IMAGE_ENABLED, True)
+
+        self.rbd.mirror_mode_set(ioctx, RBD_MIRROR_MODE_POOL)
+        fail = False
+        try:
+            self.image.mirror_image_disable(True)
+        except InvalidArgument:
+            fail = True
+        eq(True, fail) # Fails because of mirror mode pool
+
+        self.image.mirror_image_demote()
+        info = self.image.mirror_image_get_info()
+        self.check_info(info, global_id, RBD_MIRROR_IMAGE_ENABLED, False)
+
+        self.image.mirror_image_resync()
+
+        self.image.mirror_image_promote(True)
+        info = self.image.mirror_image_get_info()
+        self.check_info(info, global_id, RBD_MIRROR_IMAGE_ENABLED, True)
+
+        fail = False
+        try:
+            self.image.mirror_image_resync()
+        except InvalidArgument:
+            fail = True
+        eq(True, fail) # Fails because it is primary
+
+        status = self.image.mirror_image_get_status()
+        eq(image_name, status['name'])
+        eq(False, status['up'])
+        eq(MIRROR_IMAGE_STATUS_STATE_UNKNOWN, status['state'])
+        info = status['info']
+        self.check_info(info, global_id, RBD_MIRROR_IMAGE_ENABLED, True)
+
+    @require_features([RBD_FEATURE_EXCLUSIVE_LOCK,
+                       RBD_FEATURE_JOURNALING])
+    def test_mirror_image_status(self):
+        info = self.image.mirror_image_get_info()
+        global_id = info['global_id']
+        state = info['state']
+        primary = info['primary']
+
+        status = self.image.mirror_image_get_status()
+        eq(image_name, status['name'])
+        eq(False, status['up'])
+        eq(MIRROR_IMAGE_STATUS_STATE_UNKNOWN, status['state'])
+        info = status['info']
+        self.check_info(info, global_id, state, primary)
+
+        images = list(self.rbd.mirror_image_status_list(ioctx))
+        eq(1, len(images))
+        status = images[0]
+        eq(image_name, status['name'])
+        eq(False, status['up'])
+        eq(MIRROR_IMAGE_STATUS_STATE_UNKNOWN, status['state'])
+        info = status['info']
+        self.check_info(info, global_id, state)
+
+        states = self.rbd.mirror_image_status_summary(ioctx)
+        eq([(MIRROR_IMAGE_STATUS_STATE_UNKNOWN, 1)], states)
+
+        N = 65
+        for i in range(N):
+            self.rbd.create(ioctx, image_name + str(i), IMG_SIZE, IMG_ORDER,
+                            old_format=False, features=int(features))
+        images = list(self.rbd.mirror_image_status_list(ioctx))
+        eq(N + 1, len(images))
+        for i in range(N):
+            self.rbd.remove(ioctx, image_name + str(i))

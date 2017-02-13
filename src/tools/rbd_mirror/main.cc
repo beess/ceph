@@ -35,9 +35,9 @@ int main(int argc, const char **argv)
   env_to_vec(args);
   argv_to_vec(argc, argv, args);
 
-  global_init(nullptr, args, CEPH_ENTITY_TYPE_CLIENT,
-	      CODE_ENVIRONMENT_DAEMON,
-	      CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
+  auto cct = global_init(nullptr, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_DAEMON,
+			 CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
 
   for (auto i = args.begin(); i != args.end(); ++i) {
     if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
@@ -61,6 +61,9 @@ int main(int argc, const char **argv)
   std::vector<const char*> cmd_args;
   argv_to_vec(argc, argv, cmd_args);
 
+  // disable unnecessary librbd cache
+  g_ceph_context->_conf->set_val_or_die("rbd_cache", "false");
+
   mirror = new rbd::mirror::Mirror(g_ceph_context, cmd_args);
   int r = mirror->init();
   if (r < 0) {
@@ -77,7 +80,6 @@ int main(int argc, const char **argv)
   shutdown_async_signal_handler();
 
   delete mirror;
-  g_ceph_context->put();
 
   return r < 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

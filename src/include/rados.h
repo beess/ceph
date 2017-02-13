@@ -145,6 +145,8 @@ extern const char *ceph_osd_state_name(int s);
 #define CEPH_OSDMAP_NOREBALANCE (1<<14) /* block osd backfill unless pg is degraded */
 #define CEPH_OSDMAP_SORTBITWISE (1<<15) /* use bitwise hobject_t sort */
 #define CEPH_OSDMAP_REQUIRE_JEWEL (1<<16) /* require jewel for booting osds */
+#define CEPH_OSDMAP_REQUIRE_KRAKEN (1<<17) /* require kraken for booting osds */
+#define CEPH_OSDMAP_REQUIRE_LUMINOUS (1<<18) /* require l for booting osds */
 
 /*
  * The error code to return when an OSD can't handle a write
@@ -171,7 +173,7 @@ extern const char *ceph_osd_state_name(int s);
 #define CEPH_OSD_OP_TYPE_ATTR  0x0300
 #define CEPH_OSD_OP_TYPE_EXEC  0x0400
 #define CEPH_OSD_OP_TYPE_PG    0x0500
-#define CEPH_OSD_OP_TYPE_MULTI 0x0600 /* multiobject */
+//      LEAVE UNUSED           0x0600 used to be multiobject ops
 
 #define __CEPH_OSD_OP1(mode, nr) \
 	(CEPH_OSD_OP_MODE_##mode | (nr))
@@ -256,10 +258,8 @@ extern const char *ceph_osd_state_name(int s);
 	f(CACHE_PIN,	__CEPH_OSD_OP(WR, DATA, 36),	"cache-pin")        \
 	f(CACHE_UNPIN,	__CEPH_OSD_OP(WR, DATA, 37),	"cache-unpin")      \
 									    \
-	/** multi **/							    \
-	f(CLONERANGE,	__CEPH_OSD_OP(WR, MULTI, 1),	"clonerange")	    \
-	f(ASSERT_SRC_VERSION, __CEPH_OSD_OP(RD, MULTI, 2), "assert-src-version") \
-	f(SRC_CMPXATTR,	__CEPH_OSD_OP(RD, MULTI, 3),	"src-cmpxattr")	    \
+	/* ESX/SCSI */							    \
+	f(WRITESAME,	__CEPH_OSD_OP(WR, DATA, 38),	"write-same")	    \
 									    \
 	/** attrs **/							    \
 	/* read */							    \
@@ -281,7 +281,7 @@ extern const char *ceph_osd_state_name(int s);
 	f(SCRUB,	__CEPH_OSD_OP1(SUB, 5),		"scrub")	    \
 	f(SCRUB_RESERVE, __CEPH_OSD_OP1(SUB, 6),	"scrub-reserve")    \
 	f(SCRUB_UNRESERVE, __CEPH_OSD_OP1(SUB, 7),	"scrub-unreserve")  \
-	f(SCRUB_STOP,	__CEPH_OSD_OP1(SUB, 8),		"scrub-stop")	    \
+	/* 8 used to be scrub-stop */					\
 	f(SCRUB_MAP,	__CEPH_OSD_OP1(SUB, 9),		"scrub-map")	    \
 									    \
 	/** exec **/							    \
@@ -318,10 +318,6 @@ static inline int ceph_osd_op_type_exec(int op)
 static inline int ceph_osd_op_type_pg(int op)
 {
 	return (op & CEPH_OSD_OP_TYPE) == CEPH_OSD_OP_TYPE_PG;
-}
-static inline int ceph_osd_op_type_multi(int op)
-{
-	return (op & CEPH_OSD_OP_TYPE) == CEPH_OSD_OP_TYPE_MULTI;
 }
 
 static inline int ceph_osd_op_mode_subop(int op)
@@ -461,6 +457,29 @@ enum {
 
 const char *ceph_osd_watch_op_name(int o);
 
+enum {
+	CEPH_OSD_ALLOC_HINT_FLAG_SEQUENTIAL_WRITE = 1,
+	CEPH_OSD_ALLOC_HINT_FLAG_RANDOM_WRITE = 2,
+	CEPH_OSD_ALLOC_HINT_FLAG_SEQUENTIAL_READ = 4,
+	CEPH_OSD_ALLOC_HINT_FLAG_RANDOM_READ = 8,
+	CEPH_OSD_ALLOC_HINT_FLAG_APPEND_ONLY = 16,
+	CEPH_OSD_ALLOC_HINT_FLAG_IMMUTABLE = 32,
+	CEPH_OSD_ALLOC_HINT_FLAG_SHORTLIVED = 64,
+	CEPH_OSD_ALLOC_HINT_FLAG_LONGLIVED = 128,
+	CEPH_OSD_ALLOC_HINT_FLAG_COMPRESSIBLE = 256,
+	CEPH_OSD_ALLOC_HINT_FLAG_INCOMPRESSIBLE = 512,
+};
+
+const char *ceph_osd_alloc_hint_flag_name(int f);
+
+enum {
+	CEPH_OSD_BACKOFF_OP_BLOCK = 1,
+	CEPH_OSD_BACKOFF_OP_ACK_BLOCK = 2,
+	CEPH_OSD_BACKOFF_OP_UNBLOCK = 3,
+};
+
+const char *ceph_osd_backoff_op_name(int op);
+
 /*
  * an individual object operation.  each may be accompanied by some data
  * payload
@@ -498,6 +517,7 @@ struct ceph_osd_op {
 			__le64 ver;     /* no longer used */
 			__u8 op;	/* CEPH_OSD_WATCH_OP_* */
 			__u32 gen;      /* registration generation */
+			__u32 timeout; /* connection timeout */
 		} __attribute__ ((packed)) watch;
 		struct {
 			__le64 cookie;
@@ -532,10 +552,28 @@ struct ceph_osd_op {
 		struct {
 			__le64 expected_object_size;
 			__le64 expected_write_size;
+			__le32 flags;  /* CEPH_OSD_OP_ALLOC_HINT_FLAG_* */
 		} __attribute__ ((packed)) alloc_hint;
+		struct {
+			__le64 offset;
+			__le64 length;
+			__le64 data_length;
+		} __attribute__ ((packed)) writesame;
 	};
 	__le32 payload_len;
 } __attribute__ ((packed));
+
+/*
+ * Check the compatibility of struct ceph_osd_op
+ *  (2+4+(2*8+8+4)+4) = (sizeof(ceph_osd_op::op) +
+ *                     sizeof(ceph_osd_op::flags) +
+ *                     sizeof(ceph_osd_op::extent) +
+ *                     sizeof(ceph_osd_op::payload_len))
+ */
+#ifdef __cplusplus
+static_assert(sizeof(ceph_osd_op) == (2+4+(2*8+8+4)+4),
+              "sizeof(ceph_osd_op) breaks the compatibility");
+#endif
 
 struct ceph_osd_reply_head {
 	__le32 client_inc;                /* client incarnation */

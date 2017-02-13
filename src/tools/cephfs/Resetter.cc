@@ -23,6 +23,7 @@
 
 #include "Resetter.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 
 int Resetter::reset(mds_role_t role)
@@ -34,7 +35,7 @@ int Resetter::reset(mds_role_t role)
 
   auto fs =  fsmap->get_filesystem(role.fscid);
   assert(fs != nullptr);
-  int const pool_id = fs->mds_map.get_metadata_pool();
+  int64_t const pool_id = fs->mds_map.get_metadata_pool();
 
   JournalPointer jp(role.rank, pool_id);
   int jp_load_result = jp.load(objecter);
@@ -95,8 +96,8 @@ int Resetter::reset(mds_role_t role)
   while (!done)
     cond.Wait(mylock);
   mylock.Unlock();
-    
-  lock.Lock();
+
+  Mutex::Locker l(lock);
   if (r != 0) {
     return r;
   }
@@ -105,8 +106,6 @@ int Resetter::reset(mds_role_t role)
   if (r != 0) {
     return r;
   }
-
-  lock.Unlock();
 
   cout << "done" << std::endl;
 
@@ -117,7 +116,7 @@ int Resetter::reset_hard(mds_role_t role)
 {
   auto fs =  fsmap->get_filesystem(role.fscid);
   assert(fs != nullptr);
-  int const pool_id = fs->mds_map.get_metadata_pool();
+  int64_t const pool_id = fs->mds_map.get_metadata_pool();
 
   JournalPointer jp(role.rank, pool_id);
   jp.front = role.rank + MDS_INO_LOG_OFFSET;

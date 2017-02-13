@@ -16,6 +16,7 @@
 # GNU Library Public License for more details.
 #
 
+source $(dirname $0)/../detect-build-env-vars.sh
 source $CEPH_ROOT/qa/workunits/ceph-helpers.sh
 
 function run() {
@@ -76,6 +77,16 @@ function TEST_bench() {
     # default values should work
     #
     ceph tell osd.0 bench || return 1
+
+    #
+    # test object_size < block_size
+    ceph tell osd.0 bench 10 14456 4444 3
+    #
+
+    #
+    # test object_size < block_size & object_size = 0(default value)
+    #
+    ceph tell osd.0 bench 1 14456
 }
 
 main osd-bench "$@"

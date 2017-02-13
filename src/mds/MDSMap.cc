@@ -19,11 +19,6 @@
 using std::stringstream;
 
 
-const mds_rank_t MDSMap::MDS_NO_STANDBY_PREF(-1);
-const mds_rank_t MDSMap::MDS_STANDBY_ANY(-2);
-const mds_rank_t MDSMap::MDS_STANDBY_NAME(-3);
-const mds_rank_t MDSMap::MDS_MATCHED_ACTIVE(-4);
-
 // features
 CompatSet get_mdsmap_compat_set_all() {
   CompatSet::FeatureSet feature_compat;
@@ -83,6 +78,7 @@ void MDSMap::mds_info_t::dump(Formatter *f) const
   f->dump_int("standby_for_rank", standby_for_rank);
   f->dump_int("standby_for_fscid", standby_for_fscid);
   f->dump_string("standby_for_name", standby_for_name);
+  f->dump_bool("standby_replay", standby_replay);
   f->open_array_section("export_targets");
   for (set<mds_rank_t>::iterator p = export_targets.begin();
        p != export_targets.end(); ++p) {
@@ -188,6 +184,7 @@ void MDSMap::dump(Formatter *f) const
   f->dump_int("metadata_pool", metadata_pool);
   f->dump_bool("enabled", enabled);
   f->dump_string("fs_name", fs_name);
+  f->dump_string("balancer", balancer);
 }
 
 void MDSMap::generate_test_instances(list<MDSMap*>& ls)
@@ -230,6 +227,7 @@ void MDSMap::print(ostream& out) const
   out << "data_pools\t" << data_pools << "\n";
   out << "metadata_pool\t" << metadata_pool << "\n";
   out << "inline_data\t" << (inline_data_enabled ? "enabled" : "disabled") << "\n";
+  out << "balancer\t" << balancer << "\n";
 
   multimap< pair<mds_rank_t, unsigned>, mds_gid_t > foo;
   for (const auto &p : mds_info) {
@@ -267,7 +265,7 @@ void MDSMap::print_summary(Formatter *f, ostream *out) const
     if (p.second.laggy())
       s += "(laggy or crashed)";
 
-    if (p.second.rank >= 0) {
+    if (p.second.rank >= 0 && p.second.state != MDSMap::STATE_STANDBY_REPLAY) {
       if (f) {
 	f->open_object_section("mds");
 	f->dump_unsigned("rank", p.second.rank);
@@ -408,20 +406,21 @@ void MDSMap::get_health(list<pair<health_status_t,string> >& summary,
 
 void MDSMap::mds_info_t::encode_versioned(bufferlist& bl, uint64_t features) const
 {
-  ENCODE_START(6, 4, bl);
+  ENCODE_START(7, 4, bl);
   ::encode(global_id, bl);
   ::encode(name, bl);
   ::encode(rank, bl);
   ::encode(inc, bl);
   ::encode((int32_t)state, bl);
   ::encode(state_seq, bl);
-  ::encode(addr, bl);
+  ::encode(addr, bl, features);
   ::encode(laggy_since, bl);
   ::encode(standby_for_rank, bl);
   ::encode(standby_for_name, bl);
   ::encode(export_targets, bl);
   ::encode(mds_features, bl);
   ::encode(standby_for_fscid, bl);
+  ::encode(standby_replay, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -435,7 +434,7 @@ void MDSMap::mds_info_t::encode_unversioned(bufferlist& bl) const
   ::encode(inc, bl);
   ::encode((int32_t)state, bl);
   ::encode(state_seq, bl);
-  ::encode(addr, bl);
+  ::encode(addr, bl, 0);
   ::encode(laggy_since, bl);
   ::encode(standby_for_rank, bl);
   ::encode(standby_for_name, bl);
@@ -444,7 +443,7 @@ void MDSMap::mds_info_t::encode_unversioned(bufferlist& bl) const
 
 void MDSMap::mds_info_t::decode(bufferlist::iterator& bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(6, 4, 4, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(7, 4, 4, bl);
   ::decode(global_id, bl);
   ::decode(name, bl);
   ::decode(rank, bl);
@@ -462,6 +461,9 @@ void MDSMap::mds_info_t::decode(bufferlist::iterator& bl)
   if (struct_v >= 6) {
     ::decode(standby_for_fscid, bl);
   }
+  if (struct_v >= 7) {
+    ::decode(standby_replay, bl);
+  }
   DECODE_FINISH(bl);
 }
 
@@ -469,6 +471,13 @@ void MDSMap::mds_info_t::decode(bufferlist::iterator& bl)
 
 void MDSMap::encode(bufferlist& bl, uint64_t features) const
 {
+  std::map<mds_rank_t,int32_t> inc;  // Legacy field, fake it so that
+                                     // old-mon peers have something sane
+                                     // during upgrade
+  for (const auto rank : in) {
+    inc.insert(std::make_pair(rank, epoch));
+  }
+
   if ((features & CEPH_FEATURE_PGID64) == 0) {
     __u16 v = 2;
     ::encode(v, bl);
@@ -549,7 +558,7 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
   ::encode(cas_pool, bl);
 
   // kclient ignores everything from here
-  __u16 ev = 10;
+  __u16 ev = 11;
   ::encode(ev, bl);
   ::encode(compat, bl);
   ::encode(metadata_pool, bl);
@@ -568,11 +577,14 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
   ::encode(enabled, bl);
   ::encode(fs_name, bl);
   ::encode(damaged, bl);
+  ::encode(balancer, bl);
   ENCODE_FINISH(bl);
 }
 
 void MDSMap::decode(bufferlist::iterator& p)
 {
+  std::map<mds_rank_t,int32_t> inc;  // Legacy field, parse and drop
+
   cached_up_features = 0;
   DECODE_START_LEGACY_COMPAT_LEN_16(5, 4, 4, p);
   ::decode(epoch, p);
@@ -670,6 +682,10 @@ void MDSMap::decode(bufferlist::iterator& p)
   if (ev >= 9) {
     ::decode(damaged, p);
   }
+
+  if (ev >= 11) {
+  ::decode(balancer, p);
+  }
   DECODE_FINISH(p);
 }
 
@@ -717,4 +733,30 @@ MDSMap::availability_t MDSMap::is_cluster_available() const
     // that the client doesn't block.
     return STUCK_UNAVAILABLE;
   }
+}
+
+bool MDSMap::state_transition_valid(DaemonState prev, DaemonState next)
+{
+  bool state_valid = true;
+  if (next != prev) {
+    if (prev == MDSMap::STATE_REPLAY) {
+      if (next != MDSMap::STATE_RESOLVE && next != MDSMap::STATE_RECONNECT) {
+        state_valid = false;
+      }
+    } else if (prev == MDSMap::STATE_REJOIN) {
+      if (next != MDSMap::STATE_ACTIVE
+          && next != MDSMap::STATE_CLIENTREPLAY
+          && next != MDSMap::STATE_STOPPED) {
+        state_valid = false;
+      }
+    } else if (prev >= MDSMap::STATE_RECONNECT && prev < MDSMap::STATE_ACTIVE) {
+      // Once I have entered replay, the only allowable transitions are to
+      // the next next along in the sequence.
+      if (next != prev + 1) {
+        state_valid = false;
+      }
+    }
+  }
+
+  return state_valid;
 }

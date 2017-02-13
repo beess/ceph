@@ -259,16 +259,44 @@ void get_enable_arguments(po::options_description *positional,
 }
 
 int execute_enable_disable(const std::string &pool_name,
-                           rbd_mirror_mode_t mirror_mode) {
+                           rbd_mirror_mode_t next_mirror_mode,
+                           const std::string &mode) {
   librados::Rados rados;
   librados::IoCtx io_ctx;
+  rbd_mirror_mode_t current_mirror_mode;
+
   int r = utils::init(pool_name, &rados, &io_ctx);
   if (r < 0) {
     return r;
   }
 
   librbd::RBD rbd;
-  r = rbd.mirror_mode_set(io_ctx, mirror_mode);
+  r = rbd.mirror_mode_get(io_ctx, &current_mirror_mode);
+  if (r < 0) {
+    std::cerr << "rbd: failed to retrieve mirror mode: "
+              << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  if (current_mirror_mode == next_mirror_mode) {
+    if (mode == "disabled") {
+      std::cout << "mirroring is already " << mode << std::endl;
+    } else {
+      std::cout << "mirroring is already configured for "
+                << mode << " mode" << std::endl;
+    }
+    return 0;
+  } else if (next_mirror_mode == RBD_MIRROR_MODE_IMAGE &&
+             current_mirror_mode == RBD_MIRROR_MODE_POOL) {
+    std::cout << "note: changing mirroring mode from pool to image"
+              << std::endl;
+  } else if (next_mirror_mode == RBD_MIRROR_MODE_POOL &&
+             current_mirror_mode == RBD_MIRROR_MODE_IMAGE) {
+    std::cout << "note: changing mirroring mode from image to pool"
+              << std::endl;
+  }
+
+  r = rbd.mirror_mode_set(io_ctx, next_mirror_mode);
   if (r < 0) {
     return r;
   }
@@ -279,7 +307,8 @@ int execute_disable(const po::variables_map &vm) {
   size_t arg_index = 0;
   std::string pool_name = utils::get_pool_name(vm, &arg_index);
 
-  return execute_enable_disable(pool_name, RBD_MIRROR_MODE_DISABLED);
+  return execute_enable_disable(pool_name, RBD_MIRROR_MODE_DISABLED,
+                                "disabled");
 }
 
 int execute_enable(const po::variables_map &vm) {
@@ -297,7 +326,7 @@ int execute_enable(const po::variables_map &vm) {
     return -EINVAL;
   }
 
-  return execute_enable_disable(pool_name, mirror_mode);
+  return execute_enable_disable(pool_name, mirror_mode, mode);
 }
 
 void get_info_arguments(po::options_description *positional,
@@ -374,6 +403,148 @@ int execute_info(const po::variables_map &vm) {
   return 0;
 }
 
+void get_status_arguments(po::options_description *positional,
+			  po::options_description *options) {
+  at::add_pool_options(positional, options);
+  at::add_format_options(options);
+  at::add_verbose_option(options);
+}
+
+int execute_status(const po::variables_map &vm) {
+  size_t arg_index = 0;
+  std::string pool_name = utils::get_pool_name(vm, &arg_index);
+
+  at::Format::Formatter formatter;
+  int r = utils::get_formatter(vm, &formatter);
+  if (r < 0) {
+    return r;
+  }
+
+  bool verbose = vm[at::VERBOSE].as<bool>();
+
+  std::string config_path;
+  if (vm.count(at::CONFIG_PATH)) {
+    config_path = vm[at::CONFIG_PATH].as<std::string>();
+  }
+
+  librados::Rados rados;
+  librados::IoCtx io_ctx;
+  r = utils::init(pool_name, &rados, &io_ctx);
+  if (r < 0) {
+    return r;
+  }
+
+  librbd::RBD rbd;
+
+  std::map<librbd::mirror_image_status_state_t, int> states;
+  r = rbd.mirror_image_status_summary(io_ctx, &states);
+  if (r < 0) {
+    std::cerr << "rbd: failed to get status summary for mirrored images: "
+	      << cpp_strerror(r) << std::endl;
+    return r;
+  }
+
+  if (formatter != nullptr) {
+    formatter->open_object_section("status");
+  }
+
+  enum Health {Ok = 0, Warning = 1, Error = 2} health = Ok;
+  const char *names[] = {"OK", "WARNING", "ERROR"};
+  int total = 0;
+
+  for (auto &it : states) {
+    auto &state = it.first;
+    if (health < Warning &&
+	(state != MIRROR_IMAGE_STATUS_STATE_REPLAYING &&
+	 state != MIRROR_IMAGE_STATUS_STATE_STOPPED)) {
+      health = Warning;
+    }
+    if (health < Error &&
+	state == MIRROR_IMAGE_STATUS_STATE_ERROR) {
+      health = Error;
+    }
+    total += it.second;
+  }
+
+  if (formatter != nullptr) {
+    formatter->open_object_section("summary");
+    formatter->dump_string("health", names[health]);
+    formatter->open_object_section("states");
+    for (auto &it : states) {
+      std::string state_name = utils::mirror_image_status_state(it.first);
+      formatter->dump_int(state_name.c_str(), it.second);
+    }
+    formatter->close_section(); // states
+    formatter->close_section(); // summary
+  } else {
+    std::cout << "health: " << names[health] << std::endl;
+    std::cout << "images: " << total << " total" << std::endl;
+    for (auto &it : states) {
+      std::cout << "    " << it.second << " "
+		<< utils::mirror_image_status_state(it.first) << std::endl;
+    }
+  }
+
+  int ret = 0;
+
+  if (verbose) {
+    if (formatter != nullptr) {
+      formatter->open_array_section("images");
+    }
+
+    std::string last_read = "";
+    int max_read = 1024;
+    do {
+      map<std::string, librbd::mirror_image_status_t> mirror_images;
+      r = rbd.mirror_image_status_list(io_ctx, last_read, max_read,
+				       &mirror_images);
+      if (r < 0) {
+	std::cerr << "rbd: failed to list mirrored image directory: "
+		  << cpp_strerror(r) << std::endl;
+	return r;
+      }
+      for (auto it = mirror_images.begin(); it != mirror_images.end(); ++it) {
+	librbd::mirror_image_status_t &status = it->second;
+	const std::string &image_name = status.name;
+	std::string &global_image_id = status.info.global_id;
+	std::string state = utils::mirror_image_status_state(status);
+	std::string last_update = utils::timestr(status.last_update);
+
+	if (formatter != nullptr) {
+	  formatter->open_object_section("image");
+	  formatter->dump_string("name", image_name);
+	  formatter->dump_string("global_id", global_image_id);
+	  formatter->dump_string("state", state);
+	  formatter->dump_string("description", status.description);
+	  formatter->dump_string("last_update", last_update);
+	  formatter->close_section(); // image
+	} else {
+	  std::cout << "\n" << image_name << ":\n"
+		    << "  global_id:   " << global_image_id << "\n"
+		    << "  state:       " << state << "\n"
+		    << "  description: " << status.description << "\n"
+		    << "  last_update: " << last_update << std::endl;
+	}
+      }
+      if (!mirror_images.empty()) {
+	last_read = mirror_images.rbegin()->first;
+      }
+      r = mirror_images.size();
+    } while (r == max_read);
+
+    if (formatter != nullptr) {
+      formatter->close_section(); // images
+    }
+  }
+
+  if (formatter != nullptr) {
+    formatter->close_section(); // status
+    formatter->flush(std::cout);
+  }
+
+  return ret;
+}
+
 Shell::Action action_add(
   {"mirror", "pool", "peer", "add"}, {},
   "Add a mirroring peer to a pool.", "",
@@ -399,6 +570,10 @@ Shell::Action action_info(
   {"mirror", "pool", "info"}, {},
   "Show information about the pool mirroring configuration.", {},
   &get_info_arguments, &execute_info);
+Shell::Action action_status(
+  {"mirror", "pool", "status"}, {},
+  "Show status for all mirrored images in the pool.", {},
+  &get_status_arguments, &execute_status);
 
 } // namespace mirror_pool
 } // namespace action

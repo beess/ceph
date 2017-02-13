@@ -1,6 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include "acconfig.h"
 #include "tools/rbd/ArgumentTypes.h"
 #include "tools/rbd/Shell.h"
 #include "tools/rbd/Utils.h"
@@ -27,7 +28,7 @@ namespace po = boost::program_options;
 
 namespace {
 
-std::map<std::string, std::string> map_options;
+std::map<std::string, std::string> map_options; // used for both map and unmap
 
 } // anonymous namespace
 
@@ -49,7 +50,7 @@ static std::string map_option_ip_cb(const char *value_char)
     return "";
   }
 
-  return stringify(a.addr);
+  return stringify(a.get_sockaddr());
 }
 
 static std::string map_option_int_cb(const char *value_char)
@@ -129,6 +130,8 @@ static int parse_map_options(char *options)
     } else if (!strcmp(this_char, "queue_depth")) {
       if (put_map_option_value("queue_depth", value_char, map_option_int_cb))
         return -EINVAL;
+    } else if (!strcmp(this_char, "lock_on_read")) {
+      put_map_option("lock_on_read", this_char);
     } else {
       std::cerr << "rbd: unknown map option '" << this_char << "'" << std::endl;
       return -EINVAL;
@@ -138,8 +141,30 @@ static int parse_map_options(char *options)
   return 0;
 }
 
+static int parse_unmap_options(char *options)
+{
+  for (char *this_char = strtok(options, ", ");
+       this_char != NULL;
+       this_char = strtok(NULL, ",")) {
+    char *value_char;
+
+    if ((value_char = strchr(this_char, '=')) != NULL)
+      *value_char++ = '\0';
+
+    if (!strcmp(this_char, "force")) {
+      put_map_option("force", this_char);
+    } else {
+      std::cerr << "rbd: unknown unmap option '" << this_char << "'" << std::endl;
+      return -EINVAL;
+    }
+  }
+
+  return 0;
+}
+
 static int do_kernel_showmapped(Formatter *f)
 {
+#if defined(WITH_KRBD)
   struct krbd_ctx *krbd;
   int r;
 
@@ -151,11 +176,55 @@ static int do_kernel_showmapped(Formatter *f)
 
   krbd_destroy(krbd);
   return r;
+#else
+  return -1;
+#endif
+
+}
+
+/*
+ * hint user to check syslog for krbd related messages and provide suggestions
+ * based on errno return by krbd_map(). also note that even if some librbd calls
+ * fail, we atleast dump the "try dmesg..." message to aid debugging.
+ */
+static void print_error_description(const char *poolname, const char *imgname,
+				    const char *snapname, int maperrno)
+{
+  int r;
+  uint8_t oldformat;
+  librados::Rados rados;
+  librados::IoCtx ioctx;
+  librbd::Image image;
+
+  if (maperrno == -ENOENT)
+    goto done;
+
+  r = utils::init_and_open_image(poolname, imgname, snapname,
+				 true, &rados, &ioctx, &image);
+  if (r < 0)
+    goto done;
+
+  r = image.old_format(&oldformat);
+  if (r < 0)
+    goto done;
+
+  /*
+   * kernel returns -ENXIO when mapping a V2 image due to unsupported feature
+   * set - so, hint about that too...
+   */
+  if (!oldformat && (maperrno == -ENXIO)) {
+    std::cout << "RBD image feature set mismatch. You can disable features unsupported by the "
+	      << "kernel with \"rbd feature disable\"." << std::endl;
+  }
+
+ done:
+  std::cout << "In some cases useful info is found in syslog - try \"dmesg | tail\" or so." << std::endl;
 }
 
 static int do_kernel_map(const char *poolname, const char *imgname,
                          const char *snapname)
 {
+#if defined(WITH_KRBD)
   struct krbd_ctx *krbd;
   std::ostringstream oss;
   char *devnode;
@@ -181,8 +250,10 @@ static int do_kernel_map(const char *poolname, const char *imgname,
   }
 
   r = krbd_map(krbd, poolname, imgname, snapname, oss.str().c_str(), &devnode);
-  if (r < 0)
+  if (r < 0) {
+    print_error_description(poolname, imgname, snapname, r);
     goto out;
+  }
 
   std::cout << devnode << std::endl;
 
@@ -190,25 +261,41 @@ static int do_kernel_map(const char *poolname, const char *imgname,
 out:
   krbd_destroy(krbd);
   return r;
+#else
+  return -1;
+#endif
 }
 
 static int do_kernel_unmap(const char *dev, const char *poolname,
                            const char *imgname, const char *snapname)
 {
+#if defined(WITH_KRBD)
   struct krbd_ctx *krbd;
+  std::ostringstream oss;
   int r;
 
   r = krbd_create_from_context(g_ceph_context, &krbd);
   if (r < 0)
     return r;
 
+  for (auto it = map_options.cbegin(); it != map_options.cend(); ++it) {
+    if (it != map_options.cbegin())
+      oss << ",";
+    oss << it->second;
+  }
+
   if (dev)
-    r = krbd_unmap(krbd, dev);
+    r = krbd_unmap(krbd, dev, oss.str().c_str());
   else
-    r = krbd_unmap_by_spec(krbd, poolname, imgname, snapname);
+    r = krbd_unmap_by_spec(krbd, poolname, imgname, snapname,
+                           oss.str().c_str());
 
   krbd_destroy(krbd);
   return r;
+#else
+  return -1;
+#endif
+
 }
 
 void get_show_arguments(po::options_description *positional,
@@ -238,8 +325,8 @@ void get_map_arguments(po::options_description *positional,
   at::add_image_or_snap_spec_options(positional, options,
                                      at::ARGUMENT_MODIFIER_NONE);
   options->add_options()
-    ("options,o", po::value<std::string>(), "mapping options")
-    ("read-only", po::bool_switch(), "mount read-only");
+    ("options,o", po::value<std::string>(), "map options")
+    ("read-only", po::bool_switch(), "map read-only");
 }
 
 int execute_map(const po::variables_map &vm) {
@@ -302,6 +389,8 @@ void get_unmap_arguments(po::options_description *positional,
   at::add_pool_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_image_option(options, at::ARGUMENT_MODIFIER_NONE);
   at::add_snap_option(options, at::ARGUMENT_MODIFIER_NONE);
+  options->add_options()
+    ("options,o", po::value<std::string>(), "unmap options");
 }
 
 int execute_unmap(const po::variables_map &vm) {
@@ -329,6 +418,18 @@ int execute_unmap(const po::variables_map &vm) {
     std::cerr << "rbd: unmap requires either image name or device path"
               << std::endl;
     return -EINVAL;
+  }
+
+  if (vm.count("options")) {
+    char *cli_unmap_options = strdup(vm["options"].as<std::string>().c_str());
+    BOOST_SCOPE_EXIT( (cli_unmap_options) ) {
+      free(cli_unmap_options);
+    } BOOST_SCOPE_EXIT_END;
+
+    if (parse_unmap_options(cli_unmap_options)) {
+      std::cerr << "rbd: couldn't parse unmap options" << std::endl;
+      return -EINVAL;
+    }
   }
 
   utils::init_context();

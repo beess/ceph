@@ -238,7 +238,7 @@ Request Parameters
 :Description: The user for which the information is requested.
 :Type: String
 :Example: ``foo_user``
-:Required: No
+:Required: Yes
 
 
 Response Entities
@@ -307,7 +307,7 @@ None.
 Create User
 ===========
 
-Create a new user. By Default, a S3 key pair will be created automatically
+Create a new user. By default, a S3 key pair will be created automatically
 and returned in the response. If only one of ``access-key`` or ``secret-key``
 is provided, the omitted key will be automatically generated. By default, a
 generated key is added to the keyring without replacing an existing key pair.

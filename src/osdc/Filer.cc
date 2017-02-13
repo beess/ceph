@@ -14,7 +14,7 @@
 
 
 #include <mutex>
-
+#include <algorithm>
 #include "Filer.h"
 #include "osd/OSDMap.h"
 #include "Striper.h"
@@ -208,13 +208,7 @@ bool Filer::_probed(Probe *probe, const object_t& oid, uint64_t size,
   uint64_t end = 0;
 
   if (!probe->fwd) {
-    // reverse
-    vector<ObjectExtent> r;
-    for (vector<ObjectExtent>::reverse_iterator p = probe->probing.rbegin();
-	 p != probe->probing.rend();
-	 ++p)
-      r.push_back(*p);
-    probe->probing.swap(r);
+    std::reverse(probe->probing.begin(), probe->probing.end());
   }
 
   for (vector<ObjectExtent>::iterator p = probe->probing.begin();
@@ -329,7 +323,7 @@ int Filer::purge_range(inodeno_t ino,
   if (num_obj == 1) {
     object_t oid = file_object_t(ino, first_obj);
     object_locator_t oloc = OSDMap::file_to_object_locator(*layout);
-    objecter->remove(oid, oloc, snapc, mtime, flags, NULL, oncommit);
+    objecter->remove(oid, oloc, snapc, mtime, flags, oncommit);
     return 0;
   }
 
@@ -379,7 +373,7 @@ void Filer::_do_purge_range(PurgeRange *pr, int fin)
   // Issue objecter ops outside pr->lock to avoid lock dependency loop
   for (const auto& oid : remove_oids) {
     object_locator_t oloc = OSDMap::file_to_object_locator(pr->layout);
-    objecter->remove(oid, oloc, pr->snapc, pr->mtime, pr->flags, NULL,
+    objecter->remove(oid, oloc, pr->snapc, pr->mtime, pr->flags,
 		     new C_OnFinisher(new C_PurgeRange(this, pr), finisher));
   }
 }

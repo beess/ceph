@@ -120,6 +120,13 @@ private:
 	   << context.current_snap << std::endl;
       return new WriteOp(m_op, &context, oid, false, true, m_stats);
 
+    case TEST_OP_WRITESAME:
+      oid = *(rand_choose(context.oid_not_in_use));
+      cout << m_op << ": " << "writesame oid "
+	   << oid << " current snap is "
+	   << context.current_snap << std::endl;
+      return new WriteSameOp(m_op, &context, oid, m_stats);
+
     case TEST_OP_DELETE:
       oid = *(rand_choose(context.oid_not_in_use));
       cout << m_op << ": " << "delete oid " << oid << " current snap is "
@@ -229,7 +236,8 @@ private:
 
     default:
       cerr << m_op << ": Invalid op type " << type << std::endl;
-      assert(0);
+      ceph_abort();
+      return nullptr;
     }
   }
 
@@ -265,6 +273,7 @@ int main(int argc, char **argv)
     { TEST_OP_READ, "read", true },
     { TEST_OP_WRITE, "write", false },
     { TEST_OP_WRITE_EXCL, "write_excl", false },
+    { TEST_OP_WRITESAME, "writesame", false },
     { TEST_OP_DELETE, "delete", true },
     { TEST_OP_SNAP_CREATE, "snap_create", true },
     { TEST_OP_SNAP_REMOVE, "snap_remove", true },
@@ -288,6 +297,7 @@ int main(int argc, char **argv)
   string pool_name = "rbd";
   bool ec_pool = false;
   bool no_omap = false;
+  bool no_sparse = false;
   bool balance_reads = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -309,6 +319,8 @@ int main(int argc, char **argv)
       max_stride_size = atoi(argv[++i]);
     else if (strcmp(argv[i], "--no-omap") == 0)
       no_omap = true;
+    else if (strcmp(argv[i], "--no-sparse") == 0)
+      no_sparse = true;
     else if (strcmp(argv[i], "--balance_reads") == 0)
       balance_reads = true;
     else if (strcmp(argv[i], "--pool-snaps") == 0)
@@ -322,6 +334,7 @@ int main(int argc, char **argv)
       }
       ec_pool = true;
       no_omap = true;
+      no_sparse = true;
     } else if (strcmp(argv[i], "--op") == 0) {
       i++;
       if (i == argc) {
@@ -409,6 +422,7 @@ int main(int argc, char **argv)
     min_stride_size,
     max_stride_size,
     no_omap,
+    no_sparse,
     pool_snaps,
     write_fadvise_dontneed,
     id);

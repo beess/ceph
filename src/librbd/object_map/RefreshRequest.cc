@@ -2,7 +2,6 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/object_map/RefreshRequest.h"
-#include "cls/rbd/cls_rbd_client.h"
 #include "cls/lock/cls_lock_client.h"
 #include "common/dout.h"
 #include "common/errno.h"
@@ -42,6 +41,10 @@ void RefreshRequest<I>::send() {
       m_image_ctx.layout, m_image_ctx.get_image_size(m_snap_id));
   }
 
+
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 20) << this << " " << __func__ << ": "
+                 << "object_count=" << m_object_count << dendl;
   send_lock();
 }
 
@@ -60,13 +63,16 @@ void RefreshRequest<I>::apply() {
 
 template <typename I>
 void RefreshRequest<I>::send_lock() {
-  if (m_snap_id != CEPH_NOSNAP) {
+  CephContext *cct = m_image_ctx.cct;
+  if (m_object_count > cls::rbd::MAX_OBJECT_MAP_OBJECT_COUNT) {
+    send_invalidate_and_close();
+    return;
+  } else if (m_snap_id != CEPH_NOSNAP) {
     send_load();
     return;
   }
 
-  CephContext *cct = m_image_ctx.cct;
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   ldout(cct, 10) << this << " " << __func__ << ": oid=" << oid << dendl;
 
   using klass = RefreshRequest<I>;
@@ -90,7 +96,7 @@ Context *RefreshRequest<I>::handle_lock(int *ret_val) {
 template <typename I>
 void RefreshRequest<I>::send_load() {
   CephContext *cct = m_image_ctx.cct;
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   ldout(cct, 10) << this << " " << __func__ << ": oid=" << oid << dendl;
 
   librados::ObjectReadOperation op;
@@ -116,7 +122,7 @@ Context *RefreshRequest<I>::handle_load(int *ret_val) {
                                                   &m_on_disk_object_map);
   }
 
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   if (*ret_val == -EINVAL) {
      // object map is corrupt on-disk -- clear it and properly size it
      // so future IO can keep the object map in sync
@@ -214,7 +220,7 @@ Context *RefreshRequest<I>::handle_resize_invalidate(int *ret_val) {
 template <typename I>
 void RefreshRequest<I>::send_resize() {
   CephContext *cct = m_image_ctx.cct;
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   ldout(cct, 10) << this << " " << __func__ << ": oid=" << oid << dendl;
 
   librados::ObjectWriteOperation op;
@@ -245,6 +251,35 @@ Context *RefreshRequest<I>::handle_resize(int *ret_val) {
     *ret_val = 0;
   }
   apply();
+  return m_on_finish;
+}
+
+template <typename I>
+void RefreshRequest<I>::send_invalidate_and_close() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  using klass = RefreshRequest<I>;
+  Context *ctx = create_context_callback<
+    klass, &klass::handle_invalidate_and_close>(this);
+  InvalidateRequest<I> *req = InvalidateRequest<I>::create(
+    m_image_ctx, m_snap_id, false, ctx);
+
+  lderr(cct) << "object map too large: " << m_object_count << dendl;
+  RWLock::RLocker owner_locker(m_image_ctx.owner_lock);
+  RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
+  req->send();
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_invalidate_and_close(int *ret_val) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << ": r=" << *ret_val << dendl;
+
+  assert(*ret_val == 0);
+
+  *ret_val = -EFBIG;
+  m_object_map->clear();
   return m_on_finish;
 }
 

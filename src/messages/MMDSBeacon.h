@@ -38,7 +38,9 @@ enum mds_metric_t {
   MDS_HEALTH_CLIENT_OLDEST_TID,
   MDS_HEALTH_CLIENT_OLDEST_TID_MANY,
   MDS_HEALTH_DAMAGE,
-  MDS_HEALTH_READ_ONLY
+  MDS_HEALTH_READ_ONLY,
+  MDS_HEALTH_SLOW_REQUEST,
+  MDS_HEALTH_CACHE_OVERSIZED
 };
 
 /**
@@ -122,7 +124,7 @@ WRITE_CLASS_ENCODER(MDSHealth)
 
 class MMDSBeacon : public PaxosServiceMessage {
 
-  static const int HEAD_VERSION = 6;
+  static const int HEAD_VERSION = 7;
   static const int COMPAT_VERSION = 2;
 
   uuid_d fsid;
@@ -135,6 +137,7 @@ class MMDSBeacon : public PaxosServiceMessage {
   mds_rank_t      standby_for_rank;
   string          standby_for_name;
   fs_cluster_id_t standby_for_fscid;
+  bool            standby_replay;
 
   CompatSet compat;
 
@@ -145,12 +148,17 @@ class MMDSBeacon : public PaxosServiceMessage {
   uint64_t mds_features;
 
  public:
-  MMDSBeacon() : PaxosServiceMessage(MSG_MDS_BEACON, 0, HEAD_VERSION, COMPAT_VERSION) { }
+  MMDSBeacon()
+    : PaxosServiceMessage(MSG_MDS_BEACON, 0, HEAD_VERSION, COMPAT_VERSION),
+    global_id(0), state(MDSMap::STATE_NULL), standby_for_rank(MDS_RANK_NONE),
+    standby_for_fscid(FS_CLUSTER_ID_NONE), standby_replay(false),
+    mds_features(0)
+  { }
   MMDSBeacon(const uuid_d &f, mds_gid_t g, string& n, epoch_t les, MDSMap::DaemonState st, version_t se, uint64_t feat) :
     PaxosServiceMessage(MSG_MDS_BEACON, les, HEAD_VERSION, COMPAT_VERSION),
     fsid(f), global_id(g), name(n), state(st), seq(se),
     standby_for_rank(MDS_RANK_NONE), standby_for_fscid(FS_CLUSTER_ID_NONE),
-    mds_features(feat) {
+    standby_replay(false), mds_features(feat) {
   }
 private:
   ~MMDSBeacon() {}
@@ -166,6 +174,7 @@ public:
   mds_rank_t get_standby_for_rank() { return standby_for_rank; }
   const string& get_standby_for_name() { return standby_for_name; }
   const fs_cluster_id_t& get_standby_for_fscid() { return standby_for_fscid; }
+  bool get_standby_replay() const { return standby_replay; }
   uint64_t get_mds_features() const { return mds_features; }
 
   CompatSet const& get_compat() const { return compat; }
@@ -178,6 +187,7 @@ public:
   void set_standby_for_name(string& n) { standby_for_name = n; }
   void set_standby_for_name(const char* c) { standby_for_name.assign(c); }
   void set_standby_for_fscid(fs_cluster_id_t f) { standby_for_fscid = f; }
+  void set_standby_replay(bool r) { standby_replay = r; }
 
   const map<string, string>& get_sys_info() const { return sys_info; }
   void set_sys_info(const map<string, string>& i) { sys_info = i; }
@@ -203,6 +213,7 @@ public:
     }
     ::encode(mds_features, payload);
     ::encode(standby_for_fscid, payload);
+    ::encode(standby_replay, payload);
   }
   void decode_payload() {
     bufferlist::iterator p = payload.begin();
@@ -228,6 +239,16 @@ public:
     }
     if (header.version >= 6) {
       ::decode(standby_for_fscid, p);
+    }
+    if (header.version >= 7) {
+      ::decode(standby_replay, p);
+    }
+
+    if (header.version < 7  && state == MDSMap::STATE_STANDBY_REPLAY) {
+      // Old MDS daemons request the state, instead of explicitly
+      // advertising that they are configured as a replay daemon.
+      standby_replay = true;
+      state = MDSMap::STATE_STANDBY;
     }
   }
 };

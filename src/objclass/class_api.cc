@@ -5,16 +5,17 @@
 #include "common/debug.h"
 
 #include "objclass/objclass.h"
-#include "osd/ReplicatedPG.h"
+#include "osd/PrimaryLogPG.h"
+#include "osd/osd_types.h"
 
 #include "osd/ClassHandler.h"
 
 #include "auth/Crypto.h"
 #include "common/armor.h"
 
-static ClassHandler *ch;
+static constexpr int dout_subsys = ceph_subsys_objclass;
 
-#define dout_subsys ceph_subsys_objclass
+static ClassHandler *ch;
 
 void cls_initialize(ClassHandler *h)
 {
@@ -105,7 +106,7 @@ int cls_call(cls_method_context_t hctx, const char *cls, const char *method,
                                  char *indata, int datalen,
                                  char **outdata, int *outdatalen)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   bufferlist idata;
   vector<OSDOp> nops(1);
   OSDOp& op = nops[0];
@@ -119,6 +120,8 @@ int cls_call(cls_method_context_t hctx, const char *cls, const char *method,
   op.indata.append(method, op.op.cls.method_len);
   op.indata.append(indata, datalen);
   r = (*pctx)->pg->do_osd_ops(*pctx, nops);
+  if (r < 0)
+    return r;
 
   *outdata = (char *)malloc(op.outdata.length());
   if (!*outdata)
@@ -132,7 +135,7 @@ int cls_call(cls_method_context_t hctx, const char *cls, const char *method,
 int cls_getxattr(cls_method_context_t hctx, const char *name,
                                  char **outdata, int *outdatalen)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   bufferlist name_data;
   vector<OSDOp> nops(1);
   OSDOp& op = nops[0];
@@ -142,6 +145,8 @@ int cls_getxattr(cls_method_context_t hctx, const char *name,
   op.indata.append(name);
   op.op.xattr.name_len = strlen(name);
   r = (*pctx)->pg->do_osd_ops(*pctx, nops);
+  if (r < 0)
+    return r;
 
   *outdata = (char *)malloc(op.outdata.length());
   if (!*outdata)
@@ -155,7 +160,7 @@ int cls_getxattr(cls_method_context_t hctx, const char *name,
 int cls_setxattr(cls_method_context_t hctx, const char *name,
                                  const char *value, int val_len)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   bufferlist name_data;
   vector<OSDOp> nops(1);
   OSDOp& op = nops[0];
@@ -174,12 +179,14 @@ int cls_setxattr(cls_method_context_t hctx, const char *name,
 int cls_read(cls_method_context_t hctx, int ofs, int len,
                                  char **outdata, int *outdatalen)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   ops[0].op.op = CEPH_OSD_OP_SYNC_READ;
   ops[0].op.extent.offset = ofs;
   ops[0].op.extent.length = len;
   int r = (*pctx)->pg->do_osd_ops(*pctx, ops);
+  if (r < 0)
+    return r;
 
   *outdata = (char *)malloc(ops[0].outdata.length());
   if (!*outdata)
@@ -187,22 +194,19 @@ int cls_read(cls_method_context_t hctx, int ofs, int len,
   memcpy(*outdata, ops[0].outdata.c_str(), ops[0].outdata.length());
   *outdatalen = ops[0].outdata.length();
 
-  if (r < 0)
-    return r;
-
   return *outdatalen;
 }
 
 int cls_get_request_origin(cls_method_context_t hctx, entity_inst_t *origin)
 {
-  ReplicatedPG::OpContext **pctx = static_cast<ReplicatedPG::OpContext **>(hctx);
+  PrimaryLogPG::OpContext **pctx = static_cast<PrimaryLogPG::OpContext **>(hctx);
   *origin = (*pctx)->op->get_req()->get_orig_source_inst();
   return 0;
 }
 
 int cls_cxx_create(cls_method_context_t hctx, bool exclusive)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   ops[0].op.op = CEPH_OSD_OP_CREATE;
   ops[0].op.flags = (exclusive ? CEPH_OSD_OP_FLAG_EXCL : 0);
@@ -211,7 +215,7 @@ int cls_cxx_create(cls_method_context_t hctx, bool exclusive)
 
 int cls_cxx_remove(cls_method_context_t hctx)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   ops[0].op.op = CEPH_OSD_OP_DELETE;
   return (*pctx)->pg->do_osd_ops(*pctx, ops);
@@ -219,7 +223,7 @@ int cls_cxx_remove(cls_method_context_t hctx)
 
 int cls_cxx_stat(cls_method_context_t hctx, uint64_t *size, time_t *mtime)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   int ret;
   ops[0].op.op = CEPH_OSD_OP_STAT;
@@ -244,7 +248,7 @@ int cls_cxx_stat(cls_method_context_t hctx, uint64_t *size, time_t *mtime)
 
 int cls_cxx_stat2(cls_method_context_t hctx, uint64_t *size, ceph::real_time *mtime)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   int ret;
   ops[0].op.op = CEPH_OSD_OP_STAT;
@@ -275,7 +279,7 @@ int cls_cxx_read(cls_method_context_t hctx, int ofs, int len, bufferlist *outbl)
 int cls_cxx_read2(cls_method_context_t hctx, int ofs, int len,
                   bufferlist *outbl, uint32_t op_flags)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   int ret;
   ops[0].op.op = CEPH_OSD_OP_SYNC_READ;
@@ -297,7 +301,7 @@ int cls_cxx_write(cls_method_context_t hctx, int ofs, int len, bufferlist *inbl)
 int cls_cxx_write2(cls_method_context_t hctx, int ofs, int len,
                    bufferlist *inbl, uint32_t op_flags)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   ops[0].op.op = CEPH_OSD_OP_WRITE;
   ops[0].op.extent.offset = ofs;
@@ -309,7 +313,7 @@ int cls_cxx_write2(cls_method_context_t hctx, int ofs, int len,
 
 int cls_cxx_write_full(cls_method_context_t hctx, bufferlist *inbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   ops[0].op.op = CEPH_OSD_OP_WRITEFULL;
   ops[0].op.extent.offset = 0;
@@ -320,7 +324,7 @@ int cls_cxx_write_full(cls_method_context_t hctx, bufferlist *inbl)
 
 int cls_cxx_replace(cls_method_context_t hctx, int ofs, int len, bufferlist *inbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(2);
   ops[0].op.op = CEPH_OSD_OP_TRUNCATE;
   ops[0].op.extent.offset = 0;
@@ -335,7 +339,7 @@ int cls_cxx_replace(cls_method_context_t hctx, int ofs, int len, bufferlist *inb
 int cls_cxx_getxattr(cls_method_context_t hctx, const char *name,
                      bufferlist *outbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   bufferlist name_data;
   vector<OSDOp> nops(1);
   OSDOp& op = nops[0];
@@ -354,7 +358,7 @@ int cls_cxx_getxattr(cls_method_context_t hctx, const char *name,
 
 int cls_cxx_getxattrs(cls_method_context_t hctx, map<string, bufferlist> *attrset)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> nops(1);
   OSDOp& op = nops[0];
   int r;
@@ -376,7 +380,7 @@ int cls_cxx_getxattrs(cls_method_context_t hctx, map<string, bufferlist> *attrse
 int cls_cxx_setxattr(cls_method_context_t hctx, const char *name,
                      bufferlist *inbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   bufferlist name_data;
   vector<OSDOp> nops(1);
   OSDOp& op = nops[0];
@@ -394,7 +398,7 @@ int cls_cxx_setxattr(cls_method_context_t hctx, const char *name,
 
 int cls_cxx_snap_revert(cls_method_context_t hctx, snapid_t snapid)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   ops[0].op.op = CEPH_OSD_OP_ROLLBACK;
   ops[0].op.snap.snapid = snapid;
@@ -403,7 +407,7 @@ int cls_cxx_snap_revert(cls_method_context_t hctx, snapid_t snapid)
 
 int cls_cxx_map_get_all_vals(cls_method_context_t hctx, map<string, bufferlist>* vals)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   int ret;
@@ -411,7 +415,6 @@ int cls_cxx_map_get_all_vals(cls_method_context_t hctx, map<string, bufferlist>*
   string start_after;
   string filter_prefix;
   uint64_t max = (uint64_t)-1;
-  bufferlist inbl;
 
   ::encode(start_after, op.indata);
   ::encode(max, op.indata);
@@ -435,7 +438,7 @@ int cls_cxx_map_get_all_vals(cls_method_context_t hctx, map<string, bufferlist>*
 int cls_cxx_map_get_keys(cls_method_context_t hctx, const string &start_obj,
 			 uint64_t max_to_get, set<string> *keys)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   int ret;
@@ -462,12 +465,10 @@ int cls_cxx_map_get_vals(cls_method_context_t hctx, const string &start_obj,
 			 const string &filter_prefix, uint64_t max_to_get,
 			 map<string, bufferlist> *vals)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   int ret;
-
-  bufferlist inbl;
 
   ::encode(start_obj, op.indata);
   ::encode(max_to_get, op.indata);
@@ -490,7 +491,7 @@ int cls_cxx_map_get_vals(cls_method_context_t hctx, const string &start_obj,
 
 int cls_cxx_map_read_header(cls_method_context_t hctx, bufferlist *outbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   int ret;
@@ -507,7 +508,7 @@ int cls_cxx_map_read_header(cls_method_context_t hctx, bufferlist *outbl)
 int cls_cxx_map_get_val(cls_method_context_t hctx, const string &key,
 			bufferlist *outbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   int ret;
@@ -540,7 +541,7 @@ int cls_cxx_map_get_val(cls_method_context_t hctx, const string &key,
 int cls_cxx_map_set_val(cls_method_context_t hctx, const string &key,
 			bufferlist *inbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   bufferlist& update_bl = op.indata;
@@ -556,7 +557,7 @@ int cls_cxx_map_set_val(cls_method_context_t hctx, const string &key,
 int cls_cxx_map_set_vals(cls_method_context_t hctx,
 			 const std::map<string, bufferlist> *map)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   bufferlist& update_bl = op.indata;
@@ -569,7 +570,7 @@ int cls_cxx_map_set_vals(cls_method_context_t hctx,
 
 int cls_cxx_map_clear(cls_method_context_t hctx)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
 
@@ -580,7 +581,7 @@ int cls_cxx_map_clear(cls_method_context_t hctx)
 
 int cls_cxx_map_write_header(cls_method_context_t hctx, bufferlist *inbl)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   op.indata.claim(*inbl);
@@ -592,7 +593,7 @@ int cls_cxx_map_write_header(cls_method_context_t hctx, bufferlist *inbl)
 
 int cls_cxx_map_remove_key(cls_method_context_t hctx, const string &key)
 {
-  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
   bufferlist& update_bl = op.indata;
@@ -604,6 +605,28 @@ int cls_cxx_map_remove_key(cls_method_context_t hctx, const string &key)
   op.op.op = CEPH_OSD_OP_OMAPRMKEYS;
 
   return (*pctx)->pg->do_osd_ops(*pctx, ops);
+}
+
+int cls_cxx_list_watchers(cls_method_context_t hctx,
+			  obj_list_watch_response_t *watchers)
+{
+  PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
+  vector<OSDOp> nops(1);
+  OSDOp& op = nops[0];
+  int r;
+
+  op.op.op = CEPH_OSD_OP_LIST_WATCHERS;
+  r = (*pctx)->pg->do_osd_ops(*pctx, nops);
+  if (r < 0)
+    return r;
+
+  bufferlist::iterator iter = op.outdata.begin();
+  try {
+    ::decode(*watchers, iter);
+  } catch (buffer::error& err) {
+    return -EIO;
+  }
+  return 0;
 }
 
 int cls_gen_random_bytes(char *buf, int size)
@@ -619,14 +642,14 @@ int cls_gen_rand_base64(char *dest, int size) /* size should be the required str
 
   ret = cls_gen_random_bytes(buf, sizeof(buf));
   if (ret < 0) {
-    generic_derr << "cannot get random bytes: " << ret << dendl;
+    lgeneric_derr(ch->cct) << "cannot get random bytes: " << ret << dendl;
     return -1;
   }
 
   ret = ceph_armor(tmp_dest, &tmp_dest[sizeof(tmp_dest)],
 		   (const char *)buf, ((const char *)buf) + ((size - 1) * 3 + 4 - 1) / 4);
   if (ret < 0) {
-    generic_derr << "ceph_armor failed" << dendl;
+    lgeneric_derr(ch->cct) << "ceph_armor failed" << dendl;
     return -1;
   }
   tmp_dest[ret] = '\0';
@@ -638,7 +661,7 @@ int cls_gen_rand_base64(char *dest, int size) /* size should be the required str
 
 uint64_t cls_current_version(cls_method_context_t hctx)
 {
-  ReplicatedPG::OpContext *ctx = *(ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext *ctx = *(PrimaryLogPG::OpContext **)hctx;
 
   return ctx->pg->info.last_user_version;
 }
@@ -646,9 +669,21 @@ uint64_t cls_current_version(cls_method_context_t hctx)
 
 int cls_current_subop_num(cls_method_context_t hctx)
 {
-  ReplicatedPG::OpContext *ctx = *(ReplicatedPG::OpContext **)hctx;
+  PrimaryLogPG::OpContext *ctx = *(PrimaryLogPG::OpContext **)hctx;
 
   return ctx->current_osd_subop_num;
+}
+
+uint64_t cls_get_features(cls_method_context_t hctx)
+{
+  PrimaryLogPG::OpContext *ctx = *(PrimaryLogPG::OpContext **)hctx;
+  return ctx->pg->get_osdmap()->get_up_osd_features();
+}
+
+uint64_t cls_get_client_features(cls_method_context_t hctx)
+{
+  PrimaryLogPG::OpContext *ctx = *(PrimaryLogPG::OpContext **)hctx;
+  return ctx->op->get_req()->get_connection()->get_features();
 }
 
 void cls_cxx_subop_version(cls_method_context_t hctx, string *s)
@@ -675,7 +710,7 @@ int cls_log(int level, const char *format, ...)
      va_end(ap);
 #define MAX_SIZE 8196
      if ((n > -1 && n < size) || size > MAX_SIZE) {
-       dout(level) << buf << dendl;
+       ldout(ch->cct, level) << buf << dendl;
        return n;
      }
      size *= 2;

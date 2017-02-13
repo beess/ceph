@@ -112,12 +112,8 @@ e 12v
 #include "include/types.h"
 #include "mon_types.h"
 #include "include/buffer.h"
-#include "messages/PaxosServiceMessage.h"
 #include "msg/msg_types.h"
-
 #include "include/Context.h"
-
-#include "common/Timer.h"
 #include "common/perf_counters.h"
 #include <errno.h>
 
@@ -126,7 +122,6 @@ e 12v
 
 class Monitor;
 class MMonPaxos;
-class Paxos;
 
 enum {
   l_paxos_first = 45800,
@@ -626,81 +621,27 @@ private:
   /**
    * Callback class responsible for handling a Collect Timeout.
    */
-  class C_CollectTimeout : public Context {
-    Paxos *paxos;
-  public:
-    explicit C_CollectTimeout(Paxos *p) : paxos(p) {}
-    void finish(int r) {
-      if (r == -ECANCELED)
-	return;
-      paxos->collect_timeout();
-    }
-  };
-
+  class C_CollectTimeout;
   /**
    * Callback class responsible for handling an Accept Timeout.
    */
-  class C_AcceptTimeout : public Context {
-    Paxos *paxos;
-  public:
-    explicit C_AcceptTimeout(Paxos *p) : paxos(p) {}
-    void finish(int r) {
-      if (r == -ECANCELED)
-	return;
-      paxos->accept_timeout();
-    }
-  };
-
+  class C_AcceptTimeout;
   /**
    * Callback class responsible for handling a Lease Ack Timeout.
    */
-  class C_LeaseAckTimeout : public Context {
-    Paxos *paxos;
-  public:
-    explicit C_LeaseAckTimeout(Paxos *p) : paxos(p) {}
-    void finish(int r) {
-      if (r == -ECANCELED)
-	return;
-      paxos->lease_ack_timeout();
-    }
-  };
+  class C_LeaseAckTimeout;
 
   /**
    * Callback class responsible for handling a Lease Timeout.
    */
-  class C_LeaseTimeout : public Context {
-    Paxos *paxos;
-  public:
-    explicit C_LeaseTimeout(Paxos *p) : paxos(p) {}
-    void finish(int r) {
-      if (r == -ECANCELED)
-	return;
-      paxos->lease_timeout();
-    }
-  };
+  class C_LeaseTimeout;
 
   /**
    * Callback class responsible for handling a Lease Renew Timeout.
    */
-  class C_LeaseRenew : public Context {
-    Paxos *paxos;
-  public:
-    explicit C_LeaseRenew(Paxos *p) : paxos(p) {}
-    void finish(int r) {
-      if (r == -ECANCELED)
-	return;
-      paxos->lease_renew_timeout();
-    }
-  };
+  class C_LeaseRenew;
 
-  class C_Trimmed : public Context {
-    Paxos *paxos;
-  public:
-    explicit C_Trimmed(Paxos *p) : paxos(p) { }
-    void finish(int r) {
-      paxos->trimming = false;
-    }
-  };
+  class C_Trimmed;
   /**
    *
    */
@@ -716,8 +657,8 @@ public:
     C_Proposal(Context *c, bufferlist& proposal_bl) :
 	proposer_context(c),
 	bl(proposal_bl),
-        proposed(false),
-	proposal_time(ceph_clock_now(NULL))
+	proposed(false),
+	proposal_time(ceph_clock_now())
       { }
 
     void finish(int r) {
@@ -789,7 +730,7 @@ private:
    * knows something we don't and the Leader will have to abort the current
    * proposal in order to retry with the Proposal Number specified by the Peon.
    * It may also occur that the Peon replied with a lower Proposal Number, in
-   * which case we assume it is a reply to an an older value and we'll simply
+   * which case we assume it is a reply to an older value and we'll simply
    * drop it.
    * This function will also check if the Peon replied with an accepted but
    * yet uncommitted value. In this case, if its version is higher than our
@@ -1200,7 +1141,7 @@ public:
    */
   static void decode_append_transaction(MonitorDBStore::TransactionRef t,
 					bufferlist& bl) {
-    MonitorDBStore::TransactionRef vt(new MonitorDBStore::Transaction);
+    auto vt(std::make_shared<MonitorDBStore::Transaction>());
     bufferlist::iterator it = bl.begin();
     vt->decode(it);
     t->append(vt);
@@ -1271,6 +1212,14 @@ public:
    * @return the first committed version
    */
   version_t get_first_committed() { return first_committed; }
+  /** 
+   * Get the last commit time
+   *
+   * @returns Our last commit time
+  */
+  utime_t get_last_commit_time() const{
+    return last_commit_time;
+  }
   /**
    * Check if a given version is readable.
    *
@@ -1416,9 +1365,9 @@ inline ostream& operator<<(ostream& out, Paxos::C_Proposal& p)
 {
   string proposed = (p.proposed ? "proposed" : "unproposed");
   out << " " << proposed
-      << " queued " << (ceph_clock_now(NULL) - p.proposal_time)
+      << " queued " << (ceph_clock_now() - p.proposal_time)
       << " tx dump:\n";
-  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+  auto t(std::make_shared<MonitorDBStore::Transaction>());
   bufferlist::iterator p_it = p.bl.begin();
   t->decode(p_it);
   JSONFormatter f(true);

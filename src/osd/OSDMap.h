@@ -24,19 +24,11 @@
  *   disks, disk groups, total # osds,
  *
  */
-#include "common/config.h"
 #include "include/types.h"
 #include "osd_types.h"
-#include "msg/Message.h"
-#include "common/Mutex.h"
-#include "common/Clock.h"
 
-#include "include/ceph_features.h"
-
+//#include "include/ceph_features.h"
 #include "crush/CrushWrapper.h"
-
-#include "include/interval_set.h"
-
 #include <vector>
 #include <list>
 #include <set>
@@ -44,8 +36,9 @@
 #include "include/memory.h"
 using namespace std;
 
-#include "include/unordered_set.h"
-
+//forward declaration
+class CephContext;
+class CrushWrapper;
 /*
  * we track up to two intervals during which the osd was alive and
  * healthy.  the most recent is [up_from,up_thru), where up_thru is
@@ -262,7 +255,6 @@ private:
   ceph::shared_ptr<CrushWrapper> crush;       // hierarchical map
 
   friend class OSDMonitor;
-  friend class PGMonitor;
 
  public:
   OSDMap() : epoch(0), 
@@ -283,12 +275,10 @@ private:
   }
 
   // no copying
-  /* oh, how i long for c++11...
 private:
   OSDMap(const OSDMap& other) = default;
-  const OSDMap& operator=(const OSDMap& other) = default;
+  OSDMap& operator=(const OSDMap& other) = default;
 public:
-  */
 
   void deepish_copy_from(const OSDMap& o) {
     *this = o;
@@ -455,21 +445,19 @@ public:
   }
 
   /**
-   * check if an entire crush subtre is down
+   * check if an entire crush subtree is down
    */
   bool subtree_is_down(int id, set<int> *down_cache) const;
   bool containing_subtree_is_down(CephContext *cct, int osd, int subtree_type, set<int> *down_cache) const;
   
   int identify_osd(const entity_addr_t& addr) const;
   int identify_osd(const uuid_d& u) const;
+  int identify_osd_on_all_channels(const entity_addr_t& addr) const;
 
   bool have_addr(const entity_addr_t& addr) const {
     return identify_osd(addr) >= 0;
   }
   int find_osd_on_ip(const entity_addr_t& ip) const;
-  bool have_inst(int osd) const {
-    return exists(osd) && is_up(osd); 
-  }
   const entity_addr_t &get_addr(int osd) const {
     assert(exists(osd));
     return osd_addrs->client_addr[osd] ? *osd_addrs->client_addr[osd] : osd_addrs->blank;
@@ -488,9 +476,13 @@ public:
     assert(exists(osd));
     return osd_addrs->hb_front_addr[osd] ? *osd_addrs->hb_front_addr[osd] : osd_addrs->blank;
   }
+  entity_inst_t get_most_recent_inst(int osd) const {
+    assert(exists(osd));
+    return entity_inst_t(entity_name_t::OSD(osd), get_addr(osd));
+  }
   entity_inst_t get_inst(int osd) const {
     assert(is_up(osd));
-    return entity_inst_t(entity_name_t::OSD(osd), get_addr(osd));
+    return get_most_recent_inst(osd);
   }
   entity_inst_t get_cluster_inst(int osd) const {
     assert(is_up(osd));
@@ -532,14 +524,9 @@ public:
     return osd_xinfo[osd];
   }
   
-  int get_any_up_osd() const {
-    for (int i=0; i<max_osd; i++)
-      if (is_up(i))
-	return i;
-    return -1;
-  }
-
   int get_next_up_osd_after(int n) const {
+    if (get_max_osd() == 0)
+      return -1;
     for (int i = n + 1; i != n; ++i) {
       if (i >= get_max_osd())
 	i = 0;
@@ -552,6 +539,8 @@ public:
   }
 
   int get_previous_up_osd_before(int n) const {
+    if (get_max_osd() == 0)
+      return -1;
     for (int i = n - 1; i != n; --i) {
       if (i < 0)
 	i = get_max_osd() - 1;
@@ -582,10 +571,8 @@ public:
   /// try to re-use/reference addrs in oldmap from newmap
   static void dedup(const OSDMap *oldmap, OSDMap *newmap);
 
-  static void remove_redundant_temporaries(CephContext *cct, const OSDMap& osdmap,
-					   Incremental *pending_inc);
-  static void remove_down_temps(CephContext *cct, const OSDMap& osdmap,
-                                Incremental *pending_inc);
+  static void clean_temps(CephContext *cct, const OSDMap& osdmap,
+			  Incremental *pending_inc);
 
   // serialize, unserialize
 private:
@@ -626,11 +613,17 @@ public:
     return pool->get_pg_num();
   }
 
+  bool pg_exists(pg_t pgid) const {
+    const pg_pool_t *p = get_pg_pool(pgid.pool());
+    return p && pgid.ps() < p->get_pg_num();
+  }
+
 private:
   /// pg -> (raw osd list)
-  int _pg_to_osds(const pg_pool_t& pool, pg_t pg,
-                  vector<int> *osds, int *primary,
-		  ps_t *ppps) const;
+  int _pg_to_raw_osds(
+    const pg_pool_t& pool, pg_t pg,
+    vector<int> *osds, int *primary,
+    ps_t *ppps) const;
   void _remove_nonexistent_osds(const pg_pool_t& pool, vector<int>& osds) const;
 
   void _apply_primary_affinity(ps_t seed, const pg_pool_t& pool,
@@ -662,7 +655,7 @@ public:
    * by anybody for data mapping purposes.
    * raw and primary must be non-NULL
    */
-  int pg_to_osds(pg_t pg, vector<int> *raw, int *primary) const;
+  int pg_to_raw_osds(pg_t pg, vector<int> *raw, int *primary) const;
   /// map a pg to its acting set. @return acting set size
   int pg_to_acting_osds(const pg_t& pg, vector<int> *acting,
                         int *acting_primary) const {
@@ -731,6 +724,9 @@ public:
   const map<int64_t,pg_pool_t>& get_pools() const {
     return pools;
   }
+  map<int64_t,pg_pool_t>& get_pools() {
+    return pools;
+  }
   const string& get_pool_name(int64_t p) const {
     map<int64_t, string>::const_iterator i = pool_name.find(p);
     assert(i != pool_name.end());
@@ -771,13 +767,7 @@ public:
       return group[0];
     return -1;  // we fail!
   }
-  int get_pg_acting_tail(pg_t pg) const {
-    vector<int> group;
-    int nrep = pg_to_acting_osds(pg, group);
-    if (nrep > 0)
-      return group[group.size()-1];
-    return -1;  // we fail!
-  }
+
   bool is_acting_osd_shard(pg_t pg, int osd, shard_id_t shard) const {
     vector<int> acting;
     int nrep = pg_to_acting_osds(pg, acting);

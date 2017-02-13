@@ -22,18 +22,11 @@
 #include "messages/MAuth.h"
 #include "messages/MAuthReply.h"
 #include "messages/MMonGlobalID.h"
-
-#include "common/Timer.h"
-#include "common/config.h"
-#include "common/cmdparse.h"
+#include "msg/Messenger.h"
 
 #include "auth/AuthServiceHandler.h"
 #include "auth/KeyRing.h"
-
-#include "osd/osd_types.h"
-
 #include "include/assert.h"
-#include "include/str_list.h"
 
 #define dout_subsys ceph_subsys_mon
 #undef dout_prefix
@@ -44,7 +37,7 @@ static ostream& _prefix(std::ostream *_dout, Monitor *mon, version_t v) {
 		<< ").auth v" << v << " ";
 }
 
-ostream& operator<<(ostream& out, AuthMonitor& pm)
+ostream& operator<<(ostream &out, const AuthMonitor &pm)
 {
   return out << "auth";
 }
@@ -128,7 +121,7 @@ void AuthMonitor::update_from_paxos(bool *need_bootstrap)
   version_t keys_ver = mon->key_server.get_ver();
   if (version == keys_ver)
     return;
-  assert(version >= keys_ver);
+  assert(version > keys_ver);
 
   version_t latest_full = get_version_latest_full();
 
@@ -195,7 +188,7 @@ void AuthMonitor::update_from_paxos(bool *need_bootstrap)
     mon->key_server.set_ver(keys_ver);
 
     if (keys_ver == 1 && mon->is_keyring_required()) {
-      MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+      auto t(std::make_shared<MonitorDBStore::Transaction>());
       t->erase("mkfs", "keyring");
       mon->store->apply_transaction(t);
     }
@@ -243,7 +236,7 @@ void AuthMonitor::encode_pending(MonitorDBStore::TransactionRef t)
   ::encode(v, bl);
   vector<Incremental>::iterator p;
   for (p = pending_auth.begin(); p != pending_auth.end(); ++p)
-    p->encode(bl, mon->get_quorum_features());
+    p->encode(bl, mon->get_quorum_con_features());
 
   version_t version = get_last_committed() + 1;
   put_version(t, version, bl);
@@ -298,7 +291,7 @@ bool AuthMonitor::preprocess_query(MonOpRequestRef op)
     return false;
 
   default:
-    assert(0);
+    ceph_abort();
     return true;
   }
 }
@@ -315,7 +308,7 @@ bool AuthMonitor::prepare_update(MonOpRequestRef op)
   case CEPH_MSG_AUTH:
     return prep_auth(op, true);
   default:
-    assert(0);
+    ceph_abort();
     return false;
   }
 }
@@ -400,7 +393,8 @@ bool AuthMonitor::prep_auth(MonOpRequestRef op, bool paxos_writable)
     if (!m->get_connection()->has_feature(CEPH_FEATURE_MSG_AUTH)) {
       if (entity_name.get_type() == CEPH_ENTITY_TYPE_MON ||
 	  entity_name.get_type() == CEPH_ENTITY_TYPE_OSD ||
-	  entity_name.get_type() == CEPH_ENTITY_TYPE_MDS) {
+	  entity_name.get_type() == CEPH_ENTITY_TYPE_MDS ||
+	  entity_name.get_type() == CEPH_ENTITY_TYPE_MGR) {
 	if (g_conf->cephx_cluster_require_signatures ||
 	    g_conf->cephx_require_signatures) {
 	  dout(1) << m->get_source_inst()
@@ -424,7 +418,8 @@ bool AuthMonitor::prep_auth(MonOpRequestRef op, bool paxos_writable)
     int type;
     if (entity_name.get_type() == CEPH_ENTITY_TYPE_MON ||
 	entity_name.get_type() == CEPH_ENTITY_TYPE_OSD ||
-	entity_name.get_type() == CEPH_ENTITY_TYPE_MDS)
+	entity_name.get_type() == CEPH_ENTITY_TYPE_MDS ||
+	entity_name.get_type() == CEPH_ENTITY_TYPE_MGR)
       type = mon->auth_cluster_required.pick(supported);
     else
       type = mon->auth_service_required.pick(supported);
@@ -728,7 +723,7 @@ bool AuthMonitor::prepare_command(MonOpRequestRef op)
       ::decode(keyring, iter);
     } catch (const buffer::error &ex) {
       ss << "error decoding keyring" << " " << ex.what();
-      rs = err;
+      err = -EINVAL;
       goto done;
     }
     import_keyring(keyring);
@@ -991,7 +986,7 @@ bool AuthMonitor::prepare_command(MonOpRequestRef op)
     wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, rs,
 					      get_last_committed() + 1));
     return true;
-  } else if ((prefix == "auth del" || prefix == "auto rm") &&
+  } else if ((prefix == "auth del" || prefix == "auth rm") &&
              !entity_name.empty()) {
     KeyServerData::Incremental auth_inc;
     auth_inc.name = entity;

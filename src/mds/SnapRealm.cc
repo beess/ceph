@@ -23,6 +23,7 @@
  * SnapRealm
  */
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, mdcache->mds->get_nodeid(), inode, srnode.seq, this)
@@ -171,6 +172,13 @@ bool SnapRealm::_open_parents(MDSInternalContextBase *finish, snapid_t first, sn
   return true;
 }
 
+bool SnapRealm::open_parents(MDSInternalContextBase *retryorfinish) {
+  if (!_open_parents(retryorfinish))
+    return false;
+  delete retryorfinish;
+  return true;
+}
+
 bool SnapRealm::have_past_parents_open(snapid_t first, snapid_t last)
 {
   dout(10) << "have_past_parents_open [" << first << "," << last << "]" << dendl;
@@ -189,8 +197,8 @@ bool SnapRealm::have_past_parents_open(snapid_t first, snapid_t last)
       return false;
     }
     SnapRealm *parent_realm = open_past_parents[p->second.ino].first;
-    if (parent_realm->have_past_parents_open(MAX(first, p->second.first),
-					     MIN(last, p->first)))
+    if (!parent_realm->have_past_parents_open(MAX(first, p->second.first),
+					      MIN(last, p->first)))
       return false;
   }
 
@@ -332,11 +340,12 @@ void SnapRealm::get_snap_info(map<snapid_t,SnapInfo*>& infomap, snapid_t first, 
 
 const string& SnapRealm::get_snapname(snapid_t snapid, inodeno_t atino)
 {
-  if (srnode.snaps.count(snapid)) {
+  auto srnode_snaps_entry = srnode.snaps.find(snapid);
+  if (srnode_snaps_entry != srnode.snaps.end()) {
     if (atino == inode->ino())
-      return srnode.snaps[snapid].name;
+      return srnode_snaps_entry->second.name;
     else
-      return srnode.snaps[snapid].get_long_name();
+      return srnode_snaps_entry->second.get_long_name();
   }
 
   map<snapid_t,snaplink_t>::iterator p = srnode.past_parents.lower_bound(snapid);

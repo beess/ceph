@@ -37,6 +37,7 @@ const static struct rgw_http_errors RGW_HTTP_ERRORS[] = {
     { ERR_TOO_MANY_BUCKETS, 400, "TooManyBuckets" },
     { ERR_MALFORMED_XML, 400, "MalformedXML" },
     { ERR_AMZ_CONTENT_SHA256_MISMATCH, 400, "XAmzContentSHA256Mismatch" },
+    { ERR_MALFORMED_DOC, 400, "MalformedPolicyDocument" },
     { ERR_LENGTH_REQUIRED, 411, "MissingContentLength" },
     { EACCES, 403, "AccessDenied" },
     { EPERM, 403, "AccessDenied" },
@@ -50,12 +51,16 @@ const static struct rgw_http_errors RGW_HTTP_ERRORS[] = {
     { ERR_NO_SUCH_WEBSITE_CONFIGURATION, 404, "NoSuchWebsiteConfiguration" },
     { ERR_NO_SUCH_UPLOAD, 404, "NoSuchUpload" },
     { ERR_NOT_FOUND, 404, "Not Found"},
+    { ERR_NO_SUCH_LC, 404, "NoSuchLifecycleConfiguration"},
+    { ERR_NO_ROLE_FOUND, 404, "NoSuchEntity"},
     { ERR_METHOD_NOT_ALLOWED, 405, "MethodNotAllowed" },
     { ETIMEDOUT, 408, "RequestTimeout" },
     { EEXIST, 409, "BucketAlreadyExists" },
     { ERR_USER_EXIST, 409, "UserAlreadyExists" },
     { ERR_EMAIL_EXIST, 409, "EmailExists" },
     { ERR_KEY_EXIST, 409, "KeyExists"},
+    { ERR_ROLE_EXISTS, 409, "EntityAlreadyExists"},
+    { ERR_DELETE_CONFLICT, 409, "DeleteConflict"},
     { ERR_INVALID_SECRET_KEY, 400, "InvalidSecretKey"},
     { ERR_INVALID_KEY_TYPE, 400, "InvalidKeyType"},
     { ERR_INVALID_CAP, 400, "InvalidCapability"},
@@ -67,15 +72,17 @@ const static struct rgw_http_errors RGW_HTTP_ERRORS[] = {
     { ERR_LOCKED, 423, "Locked" },
     { ERR_INTERNAL_ERROR, 500, "InternalError" },
     { ERR_NOT_IMPLEMENTED, 501, "NotImplemented" },
+    { ERR_SERVICE_UNAVAILABLE, 503, "ServiceUnavailable"}
 };
 
 const static struct rgw_http_errors RGW_HTTP_SWIFT_ERRORS[] = {
-    { EACCES, 401, "AccessDenied" },
+    { EACCES, 403, "AccessDenied" },
     { EPERM, 401, "AccessDenied" },
     { ERR_USER_SUSPENDED, 401, "UserSuspended" },
     { ERR_INVALID_UTF8, 412, "Invalid UTF8" },
     { ERR_BAD_URL, 412, "Bad URL" },
-    { ERR_NOT_SLO_MANIFEST, 400, "Not an SLO manifest" }
+    { ERR_NOT_SLO_MANIFEST, 400, "Not an SLO manifest" },
+    { ERR_QUOTA_EXCEEDED, 413, "QuotaExceeded" }
 };
 
 struct rgw_http_status_code {
@@ -153,6 +160,8 @@ static inline int rgw_http_error_to_errno(int http_err)
         return -EACCES;
     case 404:
         return -ENOENT;
+    case 409:
+        return -ENOTEMPTY;
     default:
         return -EIO;
   }

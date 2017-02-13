@@ -2,10 +2,8 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/image/RefreshRequest.h"
-#include "include/stringify.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "cls/lock/cls_lock_client.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "librbd/AioImageRequestWQ.h"
@@ -15,6 +13,7 @@
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
 #include "librbd/image/RefreshParentRequest.h"
+#include "librbd/journal/Policy.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -28,8 +27,10 @@ using util::create_async_context_callback;
 using util::create_context_callback;
 
 template <typename I>
-RefreshRequest<I>::RefreshRequest(I &image_ctx, Context *on_finish)
-  : m_image_ctx(image_ctx),
+RefreshRequest<I>::RefreshRequest(I &image_ctx, bool acquiring_lock,
+                                  bool skip_open_parent, Context *on_finish)
+  : m_image_ctx(image_ctx), m_acquiring_lock(acquiring_lock),
+    m_skip_open_parent_image(skip_open_parent),
     m_on_finish(create_async_context_callback(m_image_ctx, on_finish)),
     m_error_result(0), m_flush_aio(false), m_exclusive_lock(nullptr),
     m_object_map(nullptr), m_journal(nullptr), m_refresh_parent(nullptr) {
@@ -140,6 +141,13 @@ Context *RefreshRequest<I>::handle_v1_get_snapshots(int *result) {
     return m_on_finish;
   }
 
+  //m_snap_namespaces = {m_snap_names.size(), cls::rbd::UserSnapshotNamespace()};
+  m_snap_namespaces = std::vector<cls::rbd::SnapshotNamespace>(
+					    m_snap_names.size(),
+					    cls::rbd::UserSnapshotNamespace());
+
+  m_snap_timestamps = std::vector<utime_t>(m_snap_names.size(), utime_t());
+
   send_v1_get_locks();
   return nullptr;
 }
@@ -187,8 +195,28 @@ Context *RefreshRequest<I>::handle_v1_get_locks(int *result) {
     return m_on_finish;
   }
 
-  apply();
+  send_v1_apply();
+  return nullptr;
+}
 
+template <typename I>
+void RefreshRequest<I>::send_v1_apply() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  // ensure we are not in a rados callback when applying updates
+  using klass = RefreshRequest<I>;
+  Context *ctx = create_context_callback<
+    klass, &klass::handle_v1_apply>(this);
+  m_image_ctx.op_work_queue->queue(ctx, 0);
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_v1_apply(int *result) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  apply();
   return send_flush_aio();
 }
 
@@ -245,6 +273,18 @@ Context *RefreshRequest<I>::handle_v2_get_mutable_metadata(int *result) {
     return m_on_finish;
   }
 
+  if (!m_snapc.is_valid()) {
+    lderr(cct) << "image snap context is invalid!" << dendl;
+    *result = -EIO;
+    return m_on_finish;
+  }
+
+  if (m_acquiring_lock && (m_features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0) {
+    ldout(cct, 5) << "ignoring dynamically disabled exclusive lock" << dendl;
+    m_features |= RBD_FEATURE_EXCLUSIVE_LOCK;
+    m_incomplete_update = true;
+  }
+
   send_v2_get_flags();
   return nullptr;
 }
@@ -299,17 +339,63 @@ Context *RefreshRequest<I>::handle_v2_get_flags(int *result) {
     return m_on_finish;
   }
 
-  return send_v2_get_snapshots();
+  send_v2_get_group();
+  return nullptr;
 }
 
 template <typename I>
-Context *RefreshRequest<I>::send_v2_get_snapshots() {
+void RefreshRequest<I>::send_v2_get_group() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  librados::ObjectReadOperation op;
+  cls_client::image_get_group_start(&op);
+
+  using klass = RefreshRequest<I>;
+  librados::AioCompletion *comp = create_rados_ack_callback<
+    klass, &klass::handle_v2_get_group>(this);
+  m_out_bl.clear();
+  int r = m_image_ctx.md_ctx.aio_operate(m_image_ctx.header_oid, comp, &op,
+                                         &m_out_bl);
+  assert(r == 0);
+  comp->release();
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_v2_get_group(int *result) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << ": "
+                 << "r=" << *result << dendl;
+
+  if (*result == 0) {
+    bufferlist::iterator it = m_out_bl.begin();
+    cls_client::image_get_group_finish(&it, &m_group_spec);
+  }
+  if (*result == -EOPNOTSUPP) {
+    // Older OSD doesn't support RBD groups
+    *result = 0;
+    ldout(cct, 10) << "OSD does not support consistency groups" << dendl;
+  } else if (*result < 0) {
+    lderr(cct) << "failed to retrieve group: " << cpp_strerror(*result)
+               << dendl;
+    return m_on_finish;
+  }
+
+  send_v2_get_snapshots();
+  return nullptr;
+}
+
+template <typename I>
+void RefreshRequest<I>::send_v2_get_snapshots() {
   if (m_snapc.snaps.empty()) {
     m_snap_names.clear();
+    m_snap_namespaces.clear();
     m_snap_sizes.clear();
     m_snap_parents.clear();
     m_snap_protection.clear();
-    return send_v2_refresh_parent();
+    m_snap_timestamps.clear();
+    send_v2_refresh_parent();
+    return;
   }
 
   CephContext *cct = m_image_ctx.cct;
@@ -326,7 +412,6 @@ Context *RefreshRequest<I>::send_v2_get_snapshots() {
                                          &m_out_bl);
   assert(r == 0);
   comp->release();
-  return nullptr;
 }
 
 template <typename I>
@@ -338,7 +423,8 @@ Context *RefreshRequest<I>::handle_v2_get_snapshots(int *result) {
   if (*result == 0) {
     bufferlist::iterator it = m_out_bl.begin();
     *result = cls_client::snapshot_list_finish(&it, m_snapc.snaps,
-                                               &m_snap_names, &m_snap_sizes,
+                                               &m_snap_names,
+					       &m_snap_sizes,
                                                &m_snap_parents,
                                                &m_snap_protection);
   }
@@ -352,25 +438,113 @@ Context *RefreshRequest<I>::handle_v2_get_snapshots(int *result) {
     return m_on_finish;
   }
 
-  if (!m_snapc.is_valid()) {
-    lderr(cct) << "image snap context is invalid!" << dendl;
-    *result = -EIO;
-    return m_on_finish;
-  }
-
-  return send_v2_refresh_parent();
+  send_v2_get_snap_timestamps();
+  return nullptr;
 }
 
 template <typename I>
-Context *RefreshRequest<I>::send_v2_refresh_parent() {
+void RefreshRequest<I>::send_v2_get_snap_timestamps() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  librados::ObjectReadOperation op;
+  cls_client::snapshot_timestamp_list_start(&op, m_snapc.snaps);
+
+  using klass = RefreshRequest<I>;
+  librados::AioCompletion *comp = create_rados_ack_callback<
+		  klass, &klass::handle_v2_get_snap_timestamps>(this);
+  m_out_bl.clear();
+  int r = m_image_ctx.md_ctx.aio_operate(m_image_ctx.header_oid, comp, &op,
+				  &m_out_bl);
+  assert(r == 0);
+  comp->release();
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_v2_get_snap_timestamps(int *result) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << ": " << "r=" << *result << dendl;
+
+  if (*result == 0) {
+    bufferlist::iterator it = m_out_bl.begin();
+    *result = cls_client::snapshot_timestamp_list_finish(&it, m_snapc.snaps, &m_snap_timestamps);
+  }
+  if (*result == -ENOENT) {
+    ldout(cct, 10) << "out-of-sync snapshot state detected" << dendl;
+    send_v2_get_mutable_metadata();
+    return nullptr;
+  } else if (*result == -EOPNOTSUPP) {
+    m_snap_timestamps = std::vector<utime_t>(m_snap_names.size(), utime_t());
+    // Ignore it means no snap timestamps are available
+  } else if (*result < 0) {
+    lderr(cct) << "failed to retrieve snapshots: " << cpp_strerror(*result)
+               << dendl;
+    return m_on_finish;
+  }
+
+  send_v2_get_snap_namespaces();
+  return nullptr;
+}
+
+template <typename I>
+void RefreshRequest<I>::send_v2_get_snap_namespaces() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  librados::ObjectReadOperation op;
+  cls_client::snapshot_namespace_list_start(&op, m_snapc.snaps);
+
+  using klass = RefreshRequest<I>;
+  librados::AioCompletion *comp = create_rados_ack_callback<
+    klass, &klass::handle_v2_get_snap_namespaces>(this);
+  m_out_bl.clear();
+  int r = m_image_ctx.md_ctx.aio_operate(m_image_ctx.header_oid, comp, &op,
+                                         &m_out_bl);
+  assert(r == 0);
+  comp->release();
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_v2_get_snap_namespaces(int *result) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << ": "
+                 << "r=" << *result << dendl;
+
+  if (*result == 0) {
+    bufferlist::iterator it = m_out_bl.begin();
+    *result = cls_client::snapshot_namespace_list_finish(&it, m_snapc.snaps,
+                                                         &m_snap_namespaces);
+  }
+  if (*result == -ENOENT) {
+    ldout(cct, 10) << "out-of-sync snapshot state detected" << dendl;
+    send_v2_get_mutable_metadata();
+    return nullptr;
+  } else if (*result == -EOPNOTSUPP) {
+    m_snap_namespaces = std::vector
+				<cls::rbd::SnapshotNamespace>(
+					     m_snap_names.size(),
+					     cls::rbd::UserSnapshotNamespace());
+    // Ignore it means no snap namespaces are available
+  } else if (*result < 0) {
+    lderr(cct) << "failed to retrieve snapshots: " << cpp_strerror(*result)
+               << dendl;
+    return m_on_finish;
+  }
+
+  send_v2_refresh_parent();
+  return nullptr;
+}
+
+template <typename I>
+void RefreshRequest<I>::send_v2_refresh_parent() {
   {
     RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
     RWLock::RLocker parent_locker(m_image_ctx.parent_lock);
 
     parent_info parent_md;
     int r = get_parent_info(m_image_ctx.snap_id, &parent_md);
-    if (r < 0 ||
-        RefreshParentRequest<I>::is_refresh_required(m_image_ctx, parent_md)) {
+    if (!m_skip_open_parent_image && (r < 0 ||
+        RefreshParentRequest<I>::is_refresh_required(m_image_ctx, parent_md))) {
       CephContext *cct = m_image_ctx.cct;
       ldout(cct, 10) << this << " " << __func__ << dendl;
 
@@ -384,9 +558,8 @@ Context *RefreshRequest<I>::send_v2_refresh_parent() {
 
   if (m_refresh_parent != nullptr) {
     m_refresh_parent->send();
-    return nullptr;
   } else {
-    return send_v2_init_exclusive_lock();
+    send_v2_init_exclusive_lock();
   }
 }
 
@@ -399,18 +572,21 @@ Context *RefreshRequest<I>::handle_v2_refresh_parent(int *result) {
     lderr(cct) << "failed to refresh parent image: " << cpp_strerror(*result)
                << dendl;
     save_result(result);
-    return send_v2_finalize_refresh_parent();
+    send_v2_apply();
+    return nullptr;
   }
 
-  return send_v2_init_exclusive_lock();
+  send_v2_init_exclusive_lock();
+  return nullptr;
 }
 
 template <typename I>
-Context *RefreshRequest<I>::send_v2_init_exclusive_lock() {
+void RefreshRequest<I>::send_v2_init_exclusive_lock() {
   if ((m_features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0 ||
       m_image_ctx.read_only || !m_image_ctx.snap_name.empty() ||
       m_image_ctx.exclusive_lock != nullptr) {
-    return send_v2_open_object_map();
+    send_v2_open_object_map();
+    return;
   }
 
   // implies exclusive lock dynamically enabled or image open in-progress
@@ -426,7 +602,6 @@ Context *RefreshRequest<I>::send_v2_init_exclusive_lock() {
 
   RWLock::RLocker owner_locker(m_image_ctx.owner_lock);
   m_exclusive_lock->init(m_features, ctx);
-  return nullptr;
 }
 
 template <typename I>
@@ -442,25 +617,37 @@ Context *RefreshRequest<I>::handle_v2_init_exclusive_lock(int *result) {
 
   // object map and journal will be opened when exclusive lock is
   // acquired (if features are enabled)
-  return send_v2_finalize_refresh_parent();
+  send_v2_apply();
+  return nullptr;
 }
 
 template <typename I>
-Context *RefreshRequest<I>::send_v2_open_journal() {
-  if ((m_features & RBD_FEATURE_JOURNALING) == 0 ||
-      m_image_ctx.read_only ||
-      !m_image_ctx.snap_name.empty() ||
-      m_image_ctx.journal != nullptr ||
-      m_image_ctx.exclusive_lock == nullptr ||
-      !m_image_ctx.exclusive_lock->is_lock_owner()) {
+void RefreshRequest<I>::send_v2_open_journal() {
+  bool journal_disabled = (
+    (m_features & RBD_FEATURE_JOURNALING) == 0 ||
+     m_image_ctx.read_only ||
+     !m_image_ctx.snap_name.empty() ||
+     m_image_ctx.journal != nullptr ||
+     m_image_ctx.exclusive_lock == nullptr ||
+     !m_image_ctx.exclusive_lock->is_lock_owner());
+  bool journal_disabled_by_policy;
+  {
+    RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+    journal_disabled_by_policy = (
+      !journal_disabled &&
+      m_image_ctx.get_journal_policy()->journal_disabled());
+  }
 
+  if (journal_disabled || journal_disabled_by_policy) {
     // journal dynamically enabled -- doesn't own exclusive lock
     if ((m_features & RBD_FEATURE_JOURNALING) != 0 &&
+        !journal_disabled_by_policy &&
         m_image_ctx.exclusive_lock != nullptr &&
         m_image_ctx.journal == nullptr) {
       m_image_ctx.aio_work_queue->set_require_lock_on_read();
     }
-    return send_v2_block_writes();
+    send_v2_block_writes();
+    return;
   }
 
   // implies journal dynamically enabled since ExclusiveLock will init
@@ -475,7 +662,6 @@ Context *RefreshRequest<I>::send_v2_open_journal() {
   // TODO need safe close
   m_journal = m_image_ctx.create_journal();
   m_journal->open(ctx);
-  return nullptr;
 }
 
 template <typename I>
@@ -489,11 +675,12 @@ Context *RefreshRequest<I>::handle_v2_open_journal(int *result) {
     save_result(result);
   }
 
-  return send_v2_block_writes();
+  send_v2_block_writes();
+  return nullptr;
 }
 
 template <typename I>
-Context *RefreshRequest<I>::send_v2_block_writes() {
+void RefreshRequest<I>::send_v2_block_writes() {
   bool disabled_journaling = false;
   {
     RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
@@ -503,7 +690,8 @@ Context *RefreshRequest<I>::send_v2_block_writes() {
   }
 
   if (!disabled_journaling) {
-    return send_v2_finalize_refresh_parent();
+    send_v2_apply();
+    return;
   }
 
   CephContext *cct = m_image_ctx.cct;
@@ -517,7 +705,6 @@ Context *RefreshRequest<I>::send_v2_block_writes() {
 
   RWLock::RLocker owner_locker(m_image_ctx.owner_lock);
   m_image_ctx.aio_work_queue->block_writes(ctx);
-  return nullptr;
 }
 
 template <typename I>
@@ -530,18 +717,20 @@ Context *RefreshRequest<I>::handle_v2_block_writes(int *result) {
                << dendl;
     save_result(result);
   }
-  return send_v2_finalize_refresh_parent();
+  send_v2_apply();
+  return nullptr;
 }
 
 template <typename I>
-Context *RefreshRequest<I>::send_v2_open_object_map() {
+void RefreshRequest<I>::send_v2_open_object_map() {
   if ((m_features & RBD_FEATURE_OBJECT_MAP) == 0 ||
       m_image_ctx.object_map != nullptr ||
       (m_image_ctx.snap_name.empty() &&
        (m_image_ctx.read_only ||
         m_image_ctx.exclusive_lock == nullptr ||
         !m_image_ctx.exclusive_lock->is_lock_owner()))) {
-    return send_v2_open_journal();
+    send_v2_open_journal();
+    return;
   }
 
   // implies object map dynamically enabled or image open in-progress
@@ -564,7 +753,8 @@ Context *RefreshRequest<I>::send_v2_open_object_map() {
     if (m_object_map == nullptr) {
       lderr(cct) << "failed to locate snapshot: " << m_image_ctx.snap_name
                  << dendl;
-      return send_v2_open_journal();
+      send_v2_open_journal();
+      return;
     }
   }
 
@@ -572,7 +762,6 @@ Context *RefreshRequest<I>::send_v2_open_object_map() {
   Context *ctx = create_context_callback<
     klass, &klass::handle_v2_open_object_map>(this);
   m_object_map->open(ctx);
-  return nullptr;
 }
 
 template <typename I>
@@ -580,14 +769,41 @@ Context *RefreshRequest<I>::handle_v2_open_object_map(int *result) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << this << " " << __func__ << ": r=" << *result << dendl;
 
-  assert(*result == 0);
-  return send_v2_open_journal();
+  if (*result < 0) {
+    lderr(cct) << "failed to open object map: " << cpp_strerror(*result)
+               << dendl;
+    delete m_object_map;
+    m_object_map = nullptr;
+  }
+
+  send_v2_open_journal();
+  return nullptr;
+}
+
+template <typename I>
+void RefreshRequest<I>::send_v2_apply() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  // ensure we are not in a rados callback when applying updates
+  using klass = RefreshRequest<I>;
+  Context *ctx = create_context_callback<
+    klass, &klass::handle_v2_apply>(this);
+  m_image_ctx.op_work_queue->queue(ctx, 0);
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_v2_apply(int *result) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << this << " " << __func__ << dendl;
+
+  apply();
+
+  return send_v2_finalize_refresh_parent();
 }
 
 template <typename I>
 Context *RefreshRequest<I>::send_v2_finalize_refresh_parent() {
-  apply();
-
   if (m_refresh_parent == nullptr) {
     return send_v2_shut_down_exclusive_lock();
   }
@@ -726,6 +942,11 @@ Context *RefreshRequest<I>::handle_v2_close_object_map(int *result) {
 
 template <typename I>
 Context *RefreshRequest<I>::send_flush_aio() {
+  if (m_incomplete_update && m_error_result == 0) {
+    // if this was a partial refresh, notify ImageState
+    m_error_result = -ERESTART;
+  }
+
   if (m_flush_aio) {
     CephContext *cct = m_image_ctx.cct;
     ldout(cct, 10) << this << " " << __func__ << dendl;
@@ -736,7 +957,14 @@ Context *RefreshRequest<I>::send_flush_aio() {
       klass, &klass::handle_flush_aio>(this);
     m_image_ctx.flush(ctx);
     return nullptr;
+  } else if (m_error_result < 0) {
+    // propagate saved error back to caller
+    Context *ctx = create_context_callback<
+      RefreshRequest<I>, &RefreshRequest<I>::handle_error>(this);
+    m_image_ctx.op_work_queue->queue(ctx, 0);
+    return nullptr;
   }
+
   return m_on_finish;
 }
 
@@ -750,8 +978,16 @@ Context *RefreshRequest<I>::handle_flush_aio(int *result) {
                << dendl;
   }
 
+  return handle_error(result);
+}
+
+template <typename I>
+Context *RefreshRequest<I>::handle_error(int *result) {
   if (m_error_result < 0) {
     *result = m_error_result;
+
+    CephContext *cct = m_image_ctx.cct;
+    ldout(cct, 10) << this << " " << __func__ << ": r=" << *result << dendl;
   }
   return m_on_finish;
 }
@@ -783,6 +1019,7 @@ void RefreshRequest<I>::apply() {
     } else {
       m_image_ctx.features = m_features;
       m_image_ctx.flags = m_flags;
+      m_image_ctx.group_spec = m_group_spec;
       m_image_ctx.parent_md = m_parent_md;
     }
 
@@ -812,8 +1049,8 @@ void RefreshRequest<I>::apply() {
         parent = m_snap_parents[i];
       }
 
-      m_image_ctx.add_snap(m_snap_names[i], m_snapc.snaps[i].val,
-                           m_snap_sizes[i], parent, protection_status, flags);
+      m_image_ctx.add_snap(m_snap_names[i], m_snap_namespaces[i], m_snapc.snaps[i].val,
+                           m_snap_sizes[i], parent, protection_status, flags, m_snap_timestamps[i]);
     }
     m_image_ctx.snapc = m_snapc;
 
